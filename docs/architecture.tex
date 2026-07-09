@@ -6,13 +6,13 @@
 
 % ---- palette --------------------------------------------------------------
 \definecolor{enc}{HTML}{4A78B0}
-\definecolor{act}{HTML}{C2763A}
 \definecolor{add}{HTML}{7A5AA0}
 \definecolor{sub}{HTML}{B05454}
 \definecolor{vio}{HTML}{B89020}
 \definecolor{lens}{HTML}{5A9555}
 \definecolor{target}{HTML}{6B7A8C}
 \definecolor{loss}{HTML}{2E8888}
+\definecolor{dec}{HTML}{C2763A}
 \definecolor{ink}{HTML}{1A1A1A}
 
 \begin{document}
@@ -21,125 +21,116 @@
   >={Latex[length=2.4mm]},
   thick,
   node distance=9mm and 12mm,
-  enc/.style={draw=enc!80!black, fill=enc!10, rounded corners=4pt, align=center, inner sep=4pt, minimum width=30mm, minimum height=13mm, text=enc!25!black},
-  act/.style={draw=act!80!black, fill=act!10, rounded corners=4pt, align=center, inner sep=4pt, minimum width=30mm, minimum height=13mm, text=act!25!black},
-  lensblock/.style={draw=lens!75!black, line width=1.3pt, fill=lens!8, rounded corners=6pt, align=center, inner sep=7pt, minimum width=42mm, minimum height=22mm, text=lens!25!black},
-  ema/.style={draw=target!80!black, fill=target!10, rounded corners=4pt, align=center, inner sep=4pt, minimum width=28mm, minimum height=13mm, text=target!25!black},
-  los/.style={draw=loss!80!black, fill=loss!8, rounded corners=4pt, align=center, inner sep=3pt, minimum width=36mm, minimum height=17mm, text=loss!20!black},
+  enc/.style={draw=enc!80!black, fill=enc!10, rounded corners=4pt, align=center, inner sep=4pt, minimum width=32mm, minimum height=13mm, text=enc!25!black},
+  lensblock/.style={draw=lens!75!black, line width=1.3pt, fill=lens!8, rounded corners=6pt, align=center, inner sep=7pt, minimum width=46mm, minimum height=24mm, text=lens!25!black},
+  ema/.style={draw=target!80!black, fill=target!10, rounded corners=4pt, align=center, inner sep=4pt, minimum width=30mm, minimum height=13mm, text=target!25!black},
+  dec/.style={draw=dec!80!black, fill=dec!10, rounded corners=4pt, align=center, inner sep=4pt, minimum width=30mm, minimum height=13mm, text=dec!25!black},
+  los/.style={draw=loss!80!black, fill=loss!8, rounded corners=4pt, align=center, inner sep=3pt, minimum width=34mm, minimum height=16mm, text=loss!20!black},
   latent/.style={draw=ink!50, fill=white, rounded corners=2pt, inner sep=3pt, minimum height=7mm, font=\sffamily\footnotesize, text=ink},
   decision/.style={diamond, draw=vio!80!black, fill=vio!15, align=center, inner sep=2pt, font=\sffamily\scriptsize, text=vio!40!black, minimum width=20mm, minimum height=14mm},
   smallnode/.style={draw=add!70!black, fill=white, rounded corners=3pt, align=center, inner sep=3pt, minimum height=8mm, font=\sffamily\footnotesize},
   op/.style={circle, draw=ink!55, fill=white, inner sep=0pt, minimum size=5mm, font=\sffamily\scriptsize, text=ink},
   arr/.style={->, draw=ink!70},
   tarr/.style={->, draw=target!85!black, dash pattern=on 3pt off 2pt},
+  darr/.style={->, draw=dec!85!black, dash pattern=on 3pt off 2pt},
   lab/.style={font=\sffamily\scriptsize, text=ink!70, inner sep=1pt, fill=white},
 ]
 
 % ===================== TITLE ==============================================
-\node[font=\sffamily\bfseries\Large, text=ink] (title) {RD-JEPA — Recurrent Deliberation JEPA};
-\node[font=\sffamily\scriptsize, text=ink!65, text width=155mm, align=center, below=3mm of title] (subtitle)
-  {Lens-paradigm latent world model \;·\; shared refinement $F_\theta$ reused $K$ times \;·\; constant VRAM in $K$ \;·\; early-exit when $V_\psi(h_k) < \tau$};
+\node[font=\sffamily\bfseries\Large, text=ink] (title) {RD-JEPA v2 — Recurrent Deliberation JEPA};
+\node[font=\sffamily\scriptsize, text=ink!65, text width=170mm, align=center, below=3mm of title] (subtitle)
+  {Spatial latent $[B,64,4,4]$ \;·\; divergence-projection lens (Navier--Stokes masking) \;·\; energy $+$ contrastive anti-collapse \;·\; curriculum $K$ \;·\; async probing decoder};
 
-% ===================== TOP-LEVEL PIPELINE (single horizontal chain) =======
-% Everything below is positioned RELATIVE to its neighbour — no raw coordinates.
-
-\node[font=\sffamily\footnotesize, text=enc!35!black, below=18mm of title, xshift=-32mm] (stp) {$s_t$ (64$\times$64)};
-\node[enc, below=of stp] (encb) {Context Encoder $E_\theta$\\[-1pt]\scriptsize 4$\times$ConvBlock(s=2)+ConvNeXt};
-\node[latent, minimum width=20mm, below=of encb] (h0) {$h_0\in\mathbb{R}^{256}$};
+% ===================== TOP-LEVEL PIPELINE =================================
+\node[font=\sffamily\footnotesize, text=enc!35!black, below=18mm of title, xshift=-32mm] (stp) {$(s_{t\text{-}1},s_t)$ $64{\times}64{\times}6$};
+\node[enc, below=of stp] (encb) {Context Encoder $E_\theta$\\[-1pt]\scriptsize 4$\times$ConvBlock(s=2)+ConvNeXt\,+\,1$\times$1};
+\node[latent, minimum width=24mm, below=of encb] (h0) {$h_0\in\mathbb{R}^{1024}$ (spatial)};
 
 \node[lensblock, right=30mm of h0] (lens)
-  {\bfseries Deliberation Loop\\[1pt] the Lens $F_\theta$\\[3pt]
-   \footnotesize $h_k = h_{k\text{-}1}+\tanh(M_k\odot\mathrm{MLP}_{\mathrm{add}}(h_{k\text{-}1},a_t))$\\[1pt]
-   \footnotesize shared weights $\cdot$ constant VRAM in $K$};
+  {\bfseries Deliberation Loop\\[1pt] the Lens $F_\theta$ (shared weights)\\[3pt]
+   \footnotesize $h_k = h_{k\text{-}1}+\tanh\!\big(\mathrm{Proj}_{\!\nabla\!\cdot}(\mathrm{MLP}_{\mathrm{add}}(h_{k\text{-}1}))\big)$\\[1pt]
+   \footnotesize advection $\to$ incompressibility projection \;·\; constant VRAM in $K$};
 
-\node[latent, minimum width=20mm, right=28mm of lens] (hK) {$h_K$ (or early-exit $h_k$)};
+\node[latent, minimum width=22mm, right=28mm of lens] (hK) {$h_K$ (or early-exit $h_k$)};
 \node[decision, above=16mm of hK] (exit) {$v_k<\tau$?};
 \node[latent, minimum width=22mm, right=22mm of hK] (hfinal) {$h_{\mathrm{final}}$};
 
-% main chain arrows (h0 and lens share the same y, so this is a clean horizontal line)
 \draw[arr] (stp) -- (encb);
 \draw[arr] (encb) -- (h0);
 \draw[arr] (h0) -- (lens);
 \draw[arr] (lens) -- (hK);
 \draw[arr] (hK.north) -- (exit.south) node[lab, midway, right] {$v_k$};
 \draw[arr] (exit.east) -- ++(1.0,0) |- (hfinal.north) node[lab, pos=0.3, above] {yes};
-% "no, repeat" loop-back: arcs cleanly ABOVE the whole chain, well clear of the title
 \draw[arr, draw=lens!70!black, line width=1.1pt] (exit.north) -- ++(0,10mm) -| (lens.north)
-  node[lab, pos=0.62, above, text=lens!45!black] {no, repeat $\times K$ (shared weights)};
+  node[lab, pos=0.62, above, text=lens!45!black] {no, repeat $\times K_{\mathrm{epoch}}$ (shared weights)};
 
-% ===================== ACTION PIPELINE (feeds up into the lens) ===========
-\node[act, minimum width=26mm, below=20mm of h0, xshift=6mm] (aenc) {Action Encoder $A_\varphi$\\[-1pt]\scriptsize Linear$\to$GELU$\to$Linear ($3\!\to\!256$)};
-\node[latent, minimum width=18mm, below=of aenc] (ain) {$a_t\in\mathbb{R}^3\ (x,y,r)$};
-\node[latent, minimum width=18mm, above=of aenc] (aencout) {$a_{\mathrm{enc}}\in\mathbb{R}^{256}$};
-\draw[arr] (ain) -- (aenc);
-\draw[arr] (aenc) -- (aencout);
-\draw[arr, draw=act!70] (aencout.east) -- (lens.west |- aencout.east)
-  node[lab, midway, above, text=act!50!black] {$a_{\mathrm{enc}}$, every $k$};
-
-% ===================== EMA TARGET (side branch feeding the Loss) ==========
-\node[font=\sffamily\footnotesize, text=target!45!black, above=14mm of hfinal, xshift=22mm] (stp1) {$s_{t+1}$ (64$\times$64)};
+% ===================== EMA TARGET (feeds JEPA loss) =======================
+\node[font=\sffamily\footnotesize, text=target!45!black, above=14mm of hfinal, xshift=22mm] (stp1) {$(s_t,s_{t\text{+}1})$};
 \node[ema, below=of stp1] (emab) {EMA Target $E_{\bar\theta}$\\[-1pt]\scriptsize decay $0.996$, stop-grad};
-\node[latent, minimum width=22mm, below=of emab] (target) {target $\in\mathbb{R}^{256}$};
+\node[latent, minimum width=24mm, below=of emab] (target) {target $\in\mathbb{R}^{1024}$};
 \draw[tarr] (stp1) -- (emab);
 \draw[tarr] (emab) -- (target);
 
-% ===================== LOSS =================================================
-\node[los, below=26mm of lens, xshift=20mm] (ltraj) {\bfseries Trajectory $\mathcal{L}_{\mathrm{traj}}$\\[1pt]\scriptsize$\sum_k\gamma^{K\text{-}1\text{-}k}\|h_k\!-\!\text{target}\|_2^2$\\[-1pt]\scriptsize$\gamma{=}0.7$ (alt: final-only)};
-\node[los, right=6mm of ltraj] (lvaux) {\bfseries Violation aux $\mathcal{L}_v$\\[1pt]\scriptsize$\mathrm{ReLU}(v_k\!-\!v_{k\text{-}1}).\text{mean}()$\\[-1pt]\scriptsize weight $=0.01$};
-\node[los, right=6mm of lvaux] (lvsup) {\bfseries Violation sup. $\mathcal{L}_{vs}$\\[1pt]\scriptsize$V_\psi\leftarrow\|h_k\!-\!\text{target}\|^2$\\[-1pt]\scriptsize weight $=0.1$};
+% ===================== ASYNC PROBING DECODER (off the JEPA path) ==========
+\node[dec, below=20mm of hfinal, xshift=-2mm] (decb) {VizDecoder (async)\\[-1pt]\scriptsize own optim.\,+\,backward on $h_K$.detach()};
+\node[font=\sffamily\footnotesize, text=dec!40!black, below=of decb] (simg) {$\hat s_t\in[0,1]^{3\times64\times64}$};
+\draw[darr] (hfinal.south) -- ++(0,-4mm) -| (decb.north) node[lab, pos=0.4, right, text=dec!45!black] {$h_K$ (detached, every 4 steps)};
+\draw[darr] (decb) -- (simg);
+
+% ===================== LOSS STACK ==========================================
+\node[los, below=30mm of lens, xshift=-6mm] (ljepa) {\bfseries JEPA (final-only)\\[1pt]\scriptsize$\|h_K\!-\!\text{sg}(\text{target})\|_2^2$};
+\node[los, right=4mm of ljepa] (lenergy) {\bfseries Energy\\[1pt]\scriptsize$|\,\|h_K\|\!-\!\|h_0\|\,|^2$};
+\node[los, right=4mm of lenergy] (lcontrast) {\bfseries Contrastive\\[1pt]\scriptsize$\mathrm{ReLU}(m\!-\!\|h_K\!-\!h_0\|)\mathbf{1}[v_{gt}\!>\!0]$};
+\node[los, right=4mm of lcontrast] (ldiv) {\bfseries Divergence reg\\[1pt]\scriptsize$\overline{|\,\|h_k\|\!-\!\|h_{k\text{-}1}\|\,|}$};
+\node[los, below=4mm of ljepa] (lviol) {\bfseries Violation aux+sup+grounded\\[1pt]\scriptsize monotonicity $\,+\,$ residual self-sup $\,+\,$ smooth-$\ell_1$ on $v_{gt}$};
+\node[los, right=4mm of lviol] (lvic) {\bfseries VICReg var$+$cov\\[1pt]\scriptsize collapse safety net};
 \begin{pgfonlayer}{background}
-  \node[fit=(ltraj)(lvaux)(lvsup), draw=loss!55, line width=1pt, fill=loss!3, inner sep=6mm, rounded corners=8pt] (lossgroup) {};
+  \node[fit=(ljepa)(lenergy)(lcontrast)(ldiv)(lviol)(lvic), draw=loss!55, line width=1pt, fill=loss!3, inner sep=6mm, rounded corners=8pt] (lossgroup) {};
 \end{pgfonlayer}
-\node[font=\sffamily\bfseries, text=loss!30!black, above=2mm of lossgroup.north] {Loss (JEPA, no pixel decode)};
+\node[font=\sffamily\bfseries, text=loss!30!black, above=2mm of lossgroup.north] {Loss (JEPA: no pixel decode in the thinking loop)};
 
-\draw[arr] (hfinal.south) -- ++(0,-10mm) -| (ltraj.north) node[lab, pos=0.55, right] {$h_K$, all\_h, violations};
-\draw[tarr] (target.south) -- ++(0,-10mm) -| (lvsup.north) node[lab, pos=0.55, right, text=target!50!black] {target (sg)};
+\draw[arr] (hfinal.south) -- ++(0,-6mm) -| (ljepa.north) node[lab, pos=0.55, right] {$h_K$, all\_h, violations};
+\draw[tarr] (target.south) -- ++(0,-6mm) -| (ljepa.north east) node[lab, pos=0.55, right, text=target!50!black] {target (sg)};
 
-% ===================== DETAIL INSET: one refinement step (self-contained) ==
-\node[font=\sffamily\bfseries, text=lens!35!black, below=32mm of ain, xshift=6mm] (insettitle) {Inside the Lens — one refinement step $F_\theta(h_{k\text{-}1},a_t)\to h_k$};
+% ===================== DETAIL INSET: one refinement step ==================
+\node[font=\sffamily\bfseries, text=lens!35!black, below=20mm of lviol, xshift=-10mm] (insettitle) {Inside the Lens — one refinement step $F_\theta(h_{k\text{-}1})\to h_k$};
 
-\node[latent, below=26mm of insettitle, xshift=-70mm] (i_hin) {$h_{k\text{-}1}$};
-\node[op, right=of i_hin] (i_cat) {$\|$};
-\node[smallnode, draw=add!70!black, fill=add!10, right=of i_cat, minimum width=22mm] (i_add) {$\mathrm{MLP}_{\mathrm{add}}$};
-\node[latent, right=of i_add] (i_hadd) {$h^{\mathrm{add}}_k$};
-\node[op, right=of i_hadd] (i_had) {$\odot$};
-\node[smallnode, draw=ink!50, right=of i_had, minimum width=16mm] (i_tanh) {$\tanh(\cdot)$};
+\node[latent, below=8mm of insettitle, xshift=-78mm] (i_hin) {$h_{k\text{-}1}\in\mathbb{R}^{1024}$};
+\node[smallnode, draw=add!70!black, fill=add!10, right=of i_hin, minimum width=22mm] (i_add) {$\mathrm{MLP}_{\mathrm{add}}$};
+\node[latent, right=of i_add] (i_hadd) {$h^{\mathrm{add}}_k$ (flat)};
+\node[smallnode, draw=sub!70!black, fill=sub!10, right=of i_hadd, minimum width=34mm] (i_proj) {$\mathrm{Proj}_{\nabla\!\cdot}$: Sobel div $\to\alpha\to$ L2 renorm};
+\node[latent, right=of i_proj] (i_hproj) {$h^{\mathrm{proj}}_k$};
+\node[op, right=of i_hproj] (i_tanh) {$\tanh$};
 \node[op, right=of i_tanh] (i_res) {$+$};
 \node[latent, right=of i_res] (i_hout) {$h_k$};
 \node[smallnode, draw=vio!70!black, fill=vio!10, right=of i_hout, minimum width=20mm] (i_vio) {$V_\psi$};
 \node[latent, right=of i_vio] (i_vout) {$v_k$};
 
-\draw[arr] (i_hin) -- (i_cat);
-\draw[arr] (i_cat) -- (i_add);
+\draw[arr] (i_hin) -- (i_add);
 \draw[arr] (i_add) -- (i_hadd);
-\draw[arr] (i_hadd) -- (i_had);
-\draw[arr] (i_had) -- (i_tanh);
+\draw[arr] (i_hadd) -- (i_proj);
+\draw[arr] (i_proj) -- (i_hproj);
+\draw[arr] (i_hproj) -- (i_tanh);
 \draw[arr] (i_tanh) -- (i_res);
 \draw[arr] (i_res) -- (i_hout);
 \draw[arr] (i_hout) -- (i_vio);
 \draw[arr] (i_vio) -- (i_vout);
 
-% mask branch: short local arc ABOVE the row
-\node[smallnode, draw=sub!70!black, fill=sub!10, above=9mm of i_hadd, minimum width=24mm] (i_mask) {$\mathrm{MLP}_{\mathrm{mask}}\!\to\!\mathrm{Gate}$};
-\draw[arr] (i_hadd.north) -- (i_mask.south);
-\draw[arr] (i_mask.west) -| (i_had.north) node[lab, pos=0.5, above] {$M_k$};
-
-% action injection: short local arc BELOW cat
-\node[latent, below=9mm of i_cat, minimum width=16mm] (i_a) {$a_{\mathrm{enc}}$};
-\draw[arr] (i_a) -- (i_cat);
+% reshape note between flat MLP and spatial projection
+\node[lab, above=1mm of i_proj, text=sub!45!black] {reshape $\to [B,64,4,4]\to$ reshape back};
 
 % skip / residual: short local arc BELOW the whole row
 \draw[arr, draw=lens!65!black] (i_hin.south) -- ++(0,-9mm) -| (i_res.south) node[lab, pos=0.5, below, text=lens!45!black] {skip $h_{k\text{-}1}$ (residual)};
 
 \begin{pgfonlayer}{background}
-  \node[fit=(i_hin)(i_cat)(i_add)(i_hadd)(i_had)(i_tanh)(i_res)(i_hout)(i_vio)(i_vout)(i_mask)(i_a),
+  \node[fit=(i_hin)(i_add)(i_hadd)(i_proj)(i_hproj)(i_tanh)(i_res)(i_hout)(i_vio)(i_vout),
         draw=lens!45, dash pattern=on 4pt off 3pt, line width=0.9pt, fill=lens!3,
         inner sep=6mm, rounded corners=6pt] (insetgroup) {};
 \end{pgfonlayer}
 
-% ===================== FOOTER ================================================
-\node[font=\sffamily\scriptsize, text=ink!60, text width=175mm, align=center, below=12mm of insetgroup.south, xshift=6mm]
-  {$h_k = h_{k\text{-}1} + \tanh\!\big(M_k \odot \mathrm{MLP}_{\mathrm{add}}(h_{k\text{-}1}, a_t)\big)$\quad$M_k = \mathrm{Gate}\big(\mathrm{MLP}_{\mathrm{mask}}(h^{\mathrm{add}}_k)\big)$\quad VRAM constant in $K$ via weight sharing + gradient checkpointing};
+% ===================== FOOTER =============================================
+\node[font=\sffamily\scriptsize, text=ink!60, text width=185mm, align=center, below=12mm of insetgroup.south, xshift=4mm]
+  {Additive phase $=$ advection \;·\; subtractive phase $=$ CFD incompressibility projection (redistribute density, never zero) \;·\; $K_{\mathrm{epoch}}$ ramps $K_{\min}\!\to\!K_{\max}$ over warmup \;·\; VRAM constant in $K$ via weight sharing $+$ gradient checkpointing};
 
 \end{tikzpicture}
 \end{document}

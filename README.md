@@ -1,106 +1,287 @@
-# RD-JEPA
+# RD-JEPA: Recurrent Deliberation JEPA
 
-Recurrent Deliberation JEPA — a latent-space physics world model that uses
-test-time compute to iteratively refine physical predictions. POC targeting
-the Kubric MOVi-A dataset on a single RTX 3070 laptop (8GB VRAM).
+*A latent-space physics world model that buys prediction quality with test-time compute.*
 
-## What's New (v3)
+**RD-JEPA** is a latent-space world model that utilizes **test-time compute**
+to perform iterative physical refinement. Instead of a single feed-forward
+pass, it runs an internal "thinking loop" — the **Lens** — that applies an
+additive-then-subtractive refinement $K$ times until the latent is
+physically sharp. Trained as a Joint-Embedding Predictive Architecture
+(JEPA), it never decodes pixels during the thinking loop; an asynchronous
+probing decoder provides an on-demand "viewport" for visualization.
 
-- **New dataset: Kubric MOVi-A**. Pre-rendered physics videos (rigid-body
-  collisions of CLEVR-style shapes) downloaded from `gs://kubric-public/tfds`.
-  This **removes the dual-Python-version problem**: the entire pipeline
-  (download, convert, train) now runs in a single Python 3.11 env. No more
-  `.phyre39/` venv, no ABI-locked C++ simulator bindings.
-- **Pure-Python data ingestion**: MOVi's tfds shards are plain
-  `tf.Example`/`.tfrecord` records parsed with the `tfrecord` PyPI package +
-  Pillow. **No TensorFlow dependency anywhere.**
-- **RGB input**: encoder now consumes stacked RGB frames `(s_{t-1}, s_t)` →
-  `in_channels = 6` (was 2 for PhyRE scene-id maps).
-- **Action modality removed**: MOVi is passive video (no ball-drop action),
-  so the Action Encoder and action-injection ablation have been removed. The
-  Lens now refines a purely visual latent.
-- **Grounded violation supervision via collisions**: the Violation Head is now
-  trained (regression, smooth-L1) against a target derived from MOVi's
-  per-frame `events.collisions.force` — a genuine physics quantity instead of
-  PhyRE's binary `solved` flag.
-- **Linear probe** repurposed to predict the collision-force violation target
-  (MSE/R²) instead of solved/unsolved classification. The PhyRE-only AUCCESS
-  ranking metric has been removed.
+> **Target.** Consumer GPU (NVIDIA RTX 3070, 8GB VRAM). Dataset: Kubric
+> MOVi-A (pre-rendered rigid-body collisions of CLEVR-style shapes),
+> passive video — no action modality.
 
-## Quick start
+<p align="center">
+  <img src="docs/architecture.png" alt="RD-JEPA v2 architecture" width="100%"/>
+</p>
+<p align="sub"><b>Figure 1.</b> The RD-JEPA v2 pipeline. A spatial latent
+<b>[B, 64, 4, 4]</b> is refined <i>K</i> times by a weight-shared Lens whose
+subtractive phase is a CFD incompressibility projection (Navier–Stokes
+masking). Energy, contrastive, and divergence regularizers prevent mode
+collapse during BPTT. A separate VizDecoder probes the frozen <i>h<sub>K</sub></i>
+for visualization without entangling gradients with the thinking loop.
+[PDF](docs/architecture.pdf) · [SVG](docs/architecture.svg) · [source](docs/architecture.tex)</p>
+
+---
+
+## 1. Introduction
+
+Standard feed-forward world predictors throw away the whole camera at each
+step and rebuild the world from scratch. RD-JEPA keeps one camera and
+**twists the same lens** $K$ times: each tiny twist carves a physical
+impossibility away until the latent image is sharp and viable. The lens is a
+single shared refinement function $F_\theta$ reused at every step, so VRAM
+is **constant** in $K$ — whether the model thinks for 3 steps or 50, the
+memory footprint does not move. This is what makes the loop tractable on
+8 GB.
+
+The loop is not guessing the future; it is performing an optimization
+*inside* latent space, tweaking the representation until the "energy" of
+physical violations approaches zero. RD-JEPA is an iterative **constraint
+solver**, not a brute-force sequence generator. Because each step is a
+monotonic residual refinement, a violation head $V_\psi$ can terminate the
+loop as soon as the state is physically sound: trivial problems stop at
+$k\!\approx\!2$, hard ones run the full $K$. **Dynamic thinking** emerges for
+free from this residual setup.
+
+### Contributions (v2)
+
+The v2 architecture bakes three core fixes into a single unified model —
+no ablation knobs — addressing the three weaknesses of the original design:
+
+1. **Asynchronous probing decoder** — a lightweight RGB decoder trained in
+   its own optimizer + backward pass on a *detached* $h_K$, every 4 JEPA
+   steps. Zero gradient entanglement with the thinking loop; the JEPA acts
+   as the physics engine and the decoder acts as the GPU renderer.
+2. **Navier–Stokes masking** — the subtractive phase becomes a
+   *Latent Divergence Projection*: fixed Sobel divergence + a learned
+   per-sample projection scalar + L2 mass renormalization — the CFD
+   incompressibility projection. Density is *redistributed*, never zeroed,
+   so the lens handles fluids/deformation instead of just rigid bodies.
+3. **Anti-collapse training** — Latent Energy Conservation
+   ($|\,\|h_K\|-\|h_0\|\,|^2$), a Contrastive Dynamics margin loss gated
+   by the grounded collision signal, a per-step Divergence Regularizer, and
+   a curriculum-K schedule $K_{\min}\!\to\!K_{\max}$ that prevents the lens
+   from collapsing to a static universe under BPTT.
+
+## 2. Method
+
+### 2.1 Vision backbone
+
+A lightweight 4-layer strided CNN (Conv→GroupNorm→GELU, stride 2) ending in
+a ConvNeXt-flavored depthwise block and a 1×1 conv head maps the stacked
+context frames $(s_{t-1}, s_t)$ to a **spatial latent**
+$h_0 \in \mathbb{R}^{C\times4\times4}$ ($C{=}64$, flat $d{=}1024$ for the
+deliberation MLPs). Spatial structure is mandatory: the divergence
+projection in the lens needs spatial axes to operate on.
+
+An EMA copy $E_{\bar\theta}$ (decay $0.996$) of the encoder produces the
+stop-gradient JEPA target from $(s_t, s_{t+1})$. There is **no action
+modality** — MOVi is passive video, so the Lens refines a purely visual
+latent.
+
+### 2.2 The Lens: a recurrent refinement function $F_\theta$
+
+At each deliberation step $k \in \{1,\dots,K\}$ the lens produces a residual
+delta composed of two fused phases, framed as a fluid simulator:
+
+1. **Additive phase (advection)** — the lens gathers momentum.
+$$h^{\mathrm{add}}_k = \mathrm{MLP}_{\mathrm{add}}(h_{k-1})$$
+
+2. **Subtractive phase (projection)** — the CFD incompressibility step. The
+   additive update is reshaped to spatial $[\,C,4,4\,]$; a fixed Sobel
+   kernel computes the discrete divergence $\nabla\!\cdot\, h^{\mathrm{add}}$;
+   a per-channel density $\rho$ is read off and mapped through a small MLP
+   to a learned per-sample projection scalar $\alpha\!\in\!(0,1)$; the
+   divergence field is subtracted and the result is L2-renormalized so
+   $\|h^{\mathrm{proj}}\|_2 \approx \|h^{\mathrm{add}}\|_2$:
+$$h^{\mathrm{proj}}_k = \mathrm{Proj}_{\nabla\!\cdot}\!\big(h^{\mathrm{add}}_k\big)$$
+
+3. **Residual update**:
+$$h_k = h_{k-1} + \tanh\!\big(h^{\mathrm{proj}}_k\big)$$
+
+The same weights are reused at every $k$ — **constant VRAM** regardless of
+$K$ (Section 3.1). The lens cannot "cheat" by zeroing the latent to avoid
+the physical-violation loss: mass conservation is built into the projection.
+
+### 2.3 Dynamic depth & early exit
+
+A lightweight scalar head $V_\psi$ predicts the "physical error" of $h_k$.
+If $V_\psi(h_k) < \tau$, the loop terminates early — the lens is in focus —
+saving compute. Complex scenes run the full $K$; quiet ones stop at
+$k\!\approx\!2$. $V_\psi$ is trained both self-supervised (to predict the
+residual latent error to the target) and grounded against MOVi's per-frame
+collision-force magnitude (a genuine physics quantity, not a binary flag).
+
+### 2.4 Loss functions
+
+The JEPA core loss is **final-only** — MSE between $h_K$ and the
+stop-gradient EMA target. (The discounted trajectory loss was removed in v2;
+energy/divergence regularizers now supervise the whole trajectory instead.)
+
+| Loss | Form | Weight | Purpose |
+|---|---|---|---|
+| **JEPA** | $\|h_K - \mathrm{sg}(\text{target})\|_2^2$ | 1.0 | latent prediction |
+| **Energy conservation** | $\big|\,\|h_K\|_2 - \|h_0\|_2\,\big|^2$ | 0.1 | forbid zeroing the state |
+| **Contrastive dynamics** | $\mathrm{ReLU}(m - \|h_K - h_0\|_2)\cdot\mathbf{1}[v_{gt}\!>\!0]$ | 0.05 | penalize stasis when a push existed |
+| **Divergence regularization** | $\overline{\big|\,\|h_k\| - \|h_{k-1}\|\,\big|}$ | 0.05 | per-step constant density |
+| **Violation aux** | $\mathrm{ReLU}(v_k - v_{k-1}).\mathrm{mean}()$ | 0.01 | monotonic focusing |
+| **Violation self-sup** | $\mathrm{MSE}(v_k,\,\|h_k\!-\!\text{target}\|^2)$ | 0.1 | teach $V_\psi$ its own error |
+| **Violation grounded** | $\mathrm{Smooth}\ell_1(v_K, v_{gt})$ | 0.1 | collision-force regression |
+| **VICReg var + cov** | hinge std + off-diag covariance | 1.0 / 1.0 | collapse safety net |
+
+### 2.5 Asynchronous probing decoder
+
+The JEPA loss never decodes pixels. A separate `VizDecoder` (4 conv-transpose
+blocks, ~200K params) is trained in its **own optimizer + backward pass** on
+a *detached* $h_K$, every `decoder_interval=4` JEPA steps — zero gradient
+entanglement with the thinking loop. The decoder learns to reconstruct $s_t$
+from the frozen latent, providing an on-demand "viewport" to see what the
+model is imagining without forcing the JEPA to predict pixels during
+deliberation.
+
+### 2.6 Curriculum K
+
+To prevent the gradients from vanishing into a collapsed state before the
+lens knows how to focus, $K$ is not fixed at training start. A per-epoch
+linear schedule ramps $K_{\min}\!=\!1 \to K_{\max}\!=\!15$ over
+`curriculum_warmup_epochs=5` (`cfg.resolve_K(epoch)`). Both `train_step`
+and `eval_step` use the epoch's $K_{\mathrm{epoch}}$.
+
+## 3. Training & Optimization
+
+### 3.1 VRAM survival
+
+Training a recurrent loop on 8 GB requires aggressive memory management:
+
+- **Gradient checkpointing** — `torch.utils.checkpoint` inside the $K$-loop;
+  intermediate activations are discarded and recomputed during backward.
+- **Automatic Mixed Precision** — bf16 autocast on Ampere.
+- **Weight sharing** — the lens is one set of weights reused $K$ times, so
+  activation memory is the only $K$-dependent cost (and checkpointing
+  caps it).
+- **Memory-fraction guard** — `set_per_process_memory_fraction(0.7)`.
+
+### 3.2 Model size
+
+| Component | Params |
+|---|---|
+| Context encoder $E_\theta$ | 0.49 M |
+| EMA target encoder $E_{\bar\theta}$ | 0.49 M (frozen) |
+| Lens $F_\theta$ (additive MLP + divergence projection) | 1.08 M |
+| Violation head $V_\psi$ | 1.05 M |
+| **JEPA total** | **3.11 M** |
+| Asynchronous probing decoder | 0.21 M |
+
+## 4. Quick Start
+
+### 4.1 Environment
+
+A single `uv`-managed Python 3.11 env (PyTorch + `tfrecord` + Pillow).
+**No TensorFlow anywhere.**
 
 ```bash
-# Single env for everything (Python 3.11 + torch + tfrecord)
 uv sync
+```
 
-# Smoke test the data pipeline: download 1 MOVi-A shard, parse 5 videos,
-# emit a tiny npz shard. (Validates parsing without a full download.)
+### 4.2 Data
+
+MOVi-A tfds shards are parsed with the pure-Python `tfrecord` package and
+emitted as v3 `.npz` caches (RGB frames + `violation_gt`).
+
+```bash
+# Smoke test the parser: 1 shard, 5 videos, tiny npz.
 uv run python scripts/convert_movi.py --smoke
 
-# (Optional) estimate a good --force-scale before the full run:
+# (Optional) estimate --force-scale from collision-force percentiles.
 uv run python scripts/convert_movi.py --scan-scale --max-shards 20
 
-# Build the train cache (downsamples to 64x64). --max-shards N / --max-videos M
-# to bound work on an 8GB laptop for a first pass.
+# Build train cache (downsamples to 64x64).
 uv run python scripts/convert_movi.py --split train --out-split train --force-scale 1.0
 
-# Build the dev cache from MOVi's validation split.
+# Build dev cache from MOVi's validation split.
 uv run python scripts/convert_movi.py --tfds-split validation --out-split dev
+```
 
-# Train (library entry point)
-uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import train; train(Config(exp_name='default'))"
+### 4.3 Training
+
+```bash
+# Library entry point (the K=15 alias was removed in v2 — use K_max).
+uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import train; train(Config(exp_name='default', K_max=15, epochs=20))"
 
 # Metrics dashboard
 uv run aim up
 ```
 
-## Unified uv Workflow
-
-One environment, one Python version, one ML framework (PyTorch):
-
-- **Main env** (`uv sync`): Python 3.11, PyTorch, `tfrecord`, Pillow. Used for
-  data conversion AND training. No second venv, no TensorFlow.
+### 4.4 Development
 
 ```bash
-uv sync
+uv run ruff check . --fix   # lint + auto-fix
+uv run pytest               # tests (14 tests, CPU, synthetic shards)
+uv run mypy rd_jepa/        # type check
 ```
 
-## Layout
+## 5. Repository Layout
 
 ```
-rd_jepa/         library (config, data, models, losses, viz, eval)
-scripts/         convert_movi.py (data cache builder)
-tests/           pytest suite + collapse regression tests
-data/cache/      MOVi transition cache (v3 format: RGB + violation_gt)
-data/cache/_raw/ transient raw tfrecord shards (gitignored)
-docs/            architecture diagrams
+rd_jepa/
+├── config.py              single Config dataclass + resolve_K curriculum
+├── losses.py              JEPA + energy + contrastive + divergence + VICReg
+├── train.py               train_step / train_decoder_step / eval_step / train
+├── data/loader.py         MoviTransitionDataset (v3 .npz cache)
+├── models/
+│   ├── rd_jepa.py         RDJEPA: encode -> K-loop -> early exit
+│   ├── deliberation.py    DeliberationStep + DivergenceProjection + ViolationHead
+│   ├── encoder.py         spatial CNN encoder
+│   └── ema.py             EMA target encoder (BYOL-style stop-grad)
+├── eval/
+│   ├── probe.py           linear probe train/eval on violation target
+│   └── probe_module.py    ViolationProbe (MSE / R²)
+└── viz/
+    ├── decoder.py         VizDecoder + make_decoder_optimizer (async probing)
+    ├── gif_writer.py      deliberation + rollout gif rendering
+    └── aim_logger.py      Aim scalar/image logging
+scripts/convert_movi.py    MOVi tfds -> .npz cache (v3 format)
+tests/test_movi_pipeline.py  14 tests: data + model + losses + decoder contract
+docs/
+├── architecture.tex       Figure 1 source (TikZ)
+├── architecture.pdf       Figure 1 (vector)
+├── architecture.png      Figure 1 (raster, rendered @ 150 dpi)
+└── architecture.svg       Figure 1 (vector, web-friendly)
+data/cache/                MOVi transition cache (v3: RGB + violation_gt)
+runs/ + .aim/              experiment outputs
 ```
 
-## Commands
+## 6. Implementation Notes
 
-```bash
-# Development
-uv run ruff check .          # lint
-uv run ruff check . --fix    # auto-fix
-uv run pytest                # tests
-uv run mypy rd_jepa/         # type check
+- **One Python version** — `uv` manages only 3.11 (training AND data
+  generation); the previous dual-Python PhyRE setup has been removed.
+- **No TensorFlow** — MOVi tfds shards parsed with `tfrecord` (pure Python).
+- **Cache format v3** — RGB frames `[H,W,3]` uint8 + `violation_gt` float
+  (collision-force regression target), replacing PhyRE v2's scene-id maps +
+  `solved` bool.
+- **VICReg** — variance/covariance regularization prevents representation
+  collapse (a safety net beyond the energy/contrastive terms).
+- **Action modality removed** — MOVi is passive video; the Lens refines a
+  purely visual latent.
 
-# Data
-uv run python scripts/convert_movi.py --smoke
-uv run python scripts/convert_movi.py --scan-scale --max-shards 20
-uv run python scripts/convert_movi.py --split train --out-split train
-uv run python scripts/convert_movi.py --tfds-split validation --out-split dev
+## 7. v2 Breaking Changes
 
-# Training / Viz
-uv run aim up                # metrics dashboard
-```
+- `Config(K=15, ...)` no longer works — use `K_max=15`. The removed ablation
+  fields (`gate`, `latent_shape`, `loss_trajectory`, `gamma`, `tbptt_n`,
+  `K`) are **rejected**; the single unified architecture has no toggleable
+  paths.
+- Old `runs/*/ckpt.pt` files (FLAT latent + sigmoid gate) **will not load**
+  into the v2 model — `DeliberationStep` now contains `DivergenceProjection`
+  params (Sobel buffers, `mlp_alpha`) and the encoder is spatial-only.
+  Start fresh from a new run.
+- `VizDecoder.decoder_loss` no longer detaches internally — the caller
+  (`train_decoder_step`) detaches `h_K` explicitly. Direct callers of
+  `decoder_loss` must pass `h.detach()`.
 
-## Architecture Highlights
+## License
 
-- **Lens Paradigm**: Shared refinement function applied K times, constant VRAM
-- **Early exit**: Dynamic deliberation depth via violation threshold
-- **JEPA training**: Latent prediction with EMA target encoder, no pixel decode
-- **Two-frame input**: Velocity-aware via frame stacking (now RGB)
-- **Physics-grounded violation**: collision-force regression target
-
-See `rd-jepa-technical-specification.md` for full details.
+See [LICENSE](LICENSE).
