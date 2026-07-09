@@ -17,27 +17,69 @@ from ..config import Config
 
 
 class PhyreTransitionDataset(Dataset):
-    """Single-split dataset over cached (s_t, action, s_tp1) transitions."""
+    """Single-split dataset over cached (s_t, action, s_tp1) transitions.
+
+    Reads the sharded .npz cache produced by scripts/build_cache.py and
+    keeps shards in memory (no concatenation — concatenating 3GB of
+    64x64 frames on the slow /mnt/c WSL filesystem hangs). Indexing is
+    translated across shards via cumulative offsets.
+    """
 
     def __init__(self, npz_path: str | Path):
         path = Path(npz_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Cache shard not found: {path}. Run build_cache.py first.")
-        d = np.load(path, allow_pickle=True)
-        self.s_t = d["s_t"]  # [N, H, W] uint8
-        self.s_tp1 = d["s_tp1"]
-        self.action = d["action"]  # [N, 3] float32
-        self.frame_size = int(d["frame_size"])
-        self.max_id = max(int(self.s_t.max()), int(self.s_tp1.max()))
+        stem = path.stem  # e.g. "ball_cross_template_fold0_train"
+        parent = path.parent
+        shards = sorted(parent.glob(f"{stem}_shard*.npz"))
+        if shards:
+            self._s_t = []
+            self._s_tp1 = []
+            self._action = []
+            self._offsets = [0]
+            for sp in shards:
+                d = np.load(sp, allow_pickle=True)
+                self._s_t.append(d["s_t"])
+                self._s_tp1.append(d["s_tp1"])
+                self._action.append(d["action"])
+                self._offsets.append(self._offsets[-1] + d["s_t"].shape[0])
+            self.frame_size = int(np.load(shards[0])["frame_size"])
+        elif path.exists():
+            d = np.load(path, allow_pickle=True)
+            self._s_t = [d["s_t"]]
+            self._s_tp1 = [d["s_tp1"]]
+            self._action = [d["action"]]
+            self._offsets = [0, d["s_t"].shape[0]]
+            self.frame_size = int(d["frame_size"])
+        else:
+            raise FileNotFoundError(
+                f"No cache shards or single-file cache at {path}. Run build_cache.py first."
+            )
+        self.max_id = max(
+            max(int(s.max()) for s in self._s_t),
+            max(int(s.max()) for s in self._s_tp1),
+        )
 
     def __len__(self) -> int:
-        return self.s_t.shape[0]
+        return self._offsets[-1]
+
+    def _shard_for(self, idx: int) -> tuple[int, int]:
+        import bisect
+
+        shard_idx = bisect.bisect_right(self._offsets, idx) - 1
+        local_idx = idx - self._offsets[shard_idx]
+        return shard_idx, local_idx
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # normalize scene-ids to [0,1]; add channel dim -> [1, H, W]
-        s_t = torch.from_numpy(self.s_t[idx]).float().div(self.max_id).unsqueeze(0)
-        s_tp1 = torch.from_numpy(self.s_tp1[idx]).float().div(self.max_id).unsqueeze(0)
-        action = torch.from_numpy(self.action[idx])
+        shard_idx, local_idx = self._shard_for(idx)
+        s_t = (
+            torch.from_numpy(self._s_t[shard_idx][local_idx])
+            .float()
+            .div(self.max_id)
+            .unsqueeze(0)
+        )
+        s_tp1 = (
+            torch.from_numpy(self._s_tp1[shard_idx][local_idx]).float().div(self.max_id).unsqueeze(0)
+        )
+        action = torch.from_numpy(self._action[shard_idx][local_idx])
         return s_t, action, s_tp1
 
 
@@ -53,7 +95,7 @@ def build_dataloaders(cfg: Config) -> dict[str, DataLoader]:
             ds,
             batch_size=cfg.batch_size,
             shuffle=(split == "train"),
-            num_workers=2,
+            num_workers=0,  # dataset is in-RAM; forking workers re-loads shards
             pin_memory=True,
             drop_last=(split == "train"),
         )
