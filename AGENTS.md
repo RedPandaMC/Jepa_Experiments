@@ -31,18 +31,16 @@ Dataset: Kubric MOVi-A, pre-rendered tfds shards on
 `tfrecord` package + Pillow.
 
 ```bash
-# Smoke test the parser: download 1 shard, parse 5 videos, emit a tiny npz shard.
-uv run python scripts/convert_movi.py --smoke
+# Easy way (recommended): builds train + dev with recommended defaults.
+uv run python scripts/build_data.py
+uv run python scripts/build_data.py --max-shards 10   # quick test
+uv run python scripts/build_data.py --dev-only         # just dev split
+uv run python scripts/build_data.py --scan-scale        # tune force-scale
 
-# (Optional) estimate --force-scale from collision-force percentiles.
-uv run python scripts/convert_movi.py --scan-scale --max-shards 20
-
-# Build train cache (downsamples to 64x64). Bound work on an 8GB laptop:
-uv run python scripts/convert_movi.py --split train --out-split train \
+# Direct (full control): see scripts/build_data.py --help
+uv run python scripts/build_data.py --tfds-split train --out-split train \
     --max-shards 50 --force-scale 1.0
-
-# Build dev cache from MOVi's validation split.
-uv run python scripts/convert_movi.py --tfds-split validation --out-split dev
+uv run python scripts/build_data.py --tfds-split validation --out-split dev
 
 ls data/cache/movi_a_*.npz | wc -l
 ```
@@ -50,12 +48,13 @@ ls data/cache/movi_a_*.npz | wc -l
 ## Training & Evaluation
 
 ```bash
-# Train (library entry point; scripts/train_rdjepa.py was removed earlier).
-uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import train; train(Config(exp_name='default', K_max=15, epochs=20))"
+# Easy way (recommended): all Config fields are CLI overrides.
+uv run python scripts/train.py
+uv run python scripts/train.py --exp-name big --epochs 40 --batch-size 256
+uv run python scripts/train.py --fast    # 500-sample smoke test
 
-# Render rollout gif (now uses the trained RGB decoder)
-# (entry point consolidated into the library — see rd_jepa/viz/gif_writer.py)
-uv run aim up
+# Direct (library entry point; same thing without argparse):
+uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import train; train(Config(exp_name='default', K_max=15, epochs=100))"
 ```
 
 ## Key Implementation Details

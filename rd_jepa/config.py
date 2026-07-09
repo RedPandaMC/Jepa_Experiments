@@ -8,7 +8,7 @@ anti-collapse) are intrinsic, not selectable. There are no ablation knobs
 All hyperparameters live here so experiments can be swept by CLI overrides.
 
 Dataset: Kubric MOVi-A (pre-rendered physics videos, passive — no action
-modality). See scripts/convert_movi.py for cache generation.
+modality). See scripts/build_data.py for cache generation.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class Config:
     movi_variant: str = "movi_a"  # one of movi_a/b/c/d/e
     movi_resolution: int = 128  # source resolution to download (128 or 256)
     split: str = "train"  # tfds split name (train/validation/test)
-    frame_size: int = 64  # frames are downsampled to this during conversion
+    frame_size: int = 256  # frames are downsampled to this during conversion
     img_channels: int = 3  # RGB (MOVi is RGB, not PhyRE scene-id maps)
     cache_dir: Path = Path("data/cache")
     runs_dir: Path = Path("runs")
@@ -53,7 +53,7 @@ class Config:
     batch_size: int = 32
     lr: float = 3e-4
     weight_decay: float = 1e-5
-    epochs: int = 20
+    epochs: int = 100
     amp_dtype: str = "bfloat16"  # bf16 on Ampere
     grad_checkpoint: bool = True
     ema_decay: float = 0.996

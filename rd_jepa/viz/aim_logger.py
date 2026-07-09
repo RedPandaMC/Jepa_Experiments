@@ -41,11 +41,31 @@ class AimLogger:
             self.run.track(value, name=name, step=step, context=ctx)
 
     def log_image(
-        self, name: str, image, step: int, context: dict | None = None
+        self,
+        name: str,
+        image,
+        step: int,
+        context: dict | None = None,
+        caption: str = "",
     ) -> None:
+        """Log an image (or animated sequence) to Aim.
+
+        Aim requires its own ``aim.Image`` objects, not raw PIL images. A
+        single PIL image is wrapped once; a list of PIL images is wrapped
+        per-frame and tracked as a single "Images" sequence, which the Aim
+        UI renders as an animated gif (used for the K-step deliberation
+        rollout).
+        """
         if self.run is None:
             return
-        self.run.track(image, name=name, step=step, context=context or {})
+        from aim import Image as AimImage
+
+        wrapped: AimImage | list[AimImage]
+        if isinstance(image, list):
+            wrapped = [AimImage(frame, caption=caption) for frame in image]
+        else:
+            wrapped = AimImage(image, caption=caption)
+        self.run.track(wrapped, name=name, step=step, context=context or {})
 
     def close(self) -> None:
         if self.run is not None:

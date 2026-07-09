@@ -18,9 +18,8 @@ build/
 # Runs / artifacts (regenerated locally; keep the data cache)
 runs/
 *.gif
-!runs/smoke/*.png
 
-# MOVi raw tfrecord shards downloaded by scripts/convert_movi.py
+# MOVi raw tfrecord shards downloaded by scripts/build_data.py
 data/cache/_raw/
 
 # LaTeX build artifacts (keep sources + rendered pdf/png/svg)

@@ -28,6 +28,38 @@ from .losses import total_loss
 from .models.rd_jepa import RDJEPA
 from .viz.aim_logger import AimLogger
 from .viz.decoder import VizDecoder, make_decoder_optimizer
+from .viz.gif_writer import render_rollout_for_eval
+
+
+def _should_render_gifs(epoch: int, total_epochs: int) -> bool:
+    """Dense-early / sparse-late gif-rendering schedule, scaled by total epochs.
+
+    Renders every epoch for the first ~10% of training (the curriculum ramp
+    + fastest loss descent), then thins to roughly every 5% of total epochs.
+    This keeps the gif count proportional to the run length: a 100-epoch run
+    produces ~28 gif-pairs, a 20-epoch run produces ~9.
+    """
+    ramp = max(5, total_epochs // 10)
+    if epoch < ramp:
+        return True
+    interval = max(1, total_epochs // 20)
+    return (epoch - ramp) % interval == 0
+
+
+def _should_eval(epoch: int, total_epochs: int) -> bool:
+    """Validation cadence scaled by total epochs.
+
+    Evaluates every epoch for short runs (<= 20 epochs). For longer runs,
+    evaluates roughly every 5% of total epochs but always on the final
+    epoch. This keeps eval time proportional: a 100-epoch run evaluates
+    ~21 times, a 20-epoch run evaluates every epoch.
+    """
+    if epoch == total_epochs - 1:
+        return True
+    if total_epochs <= 20:
+        return True
+    interval = max(1, total_epochs // 20)
+    return epoch % interval == 0
 
 
 def _collapse_diagnostics(z: torch.Tensor) -> dict[str, float]:
@@ -176,6 +208,14 @@ def train_decoder_step(
     C = cfg.img_channels
     s_t = s_context[:, C : 2 * C, :, :].float()  # [B, C, H, W]
 
+    # The VizDecoder always outputs 64x64 (4 conv-transpose blocks from 4x4).
+    # Downsample the target to match so the MSE is well-defined regardless of
+    # the training frame_size (64, 128, 256, ...).
+    if s_t.shape[-1] != 64:
+        s_t = torch.nn.functional.interpolate(
+            s_t, size=(64, 64), mode="bilinear", align_corners=False
+        )
+
     # Decoder runs in fp32 (conv-transpose + autocast dtype edge case).
     pred = decoder(h_k.detach())
     loss = torch.nn.functional.mse_loss(pred, s_t)
@@ -323,7 +363,22 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
                 )
             step += 1
 
-        # eval (uses the same curriculum K_epoch as training)
+        # eval (uses the same curriculum K_epoch as training).
+        # Validation cadence scales with total epochs (see _should_eval).
+        if not _should_eval(epoch, cfg.epochs):
+            # Still checkpoint so training can resume.
+            ckpt = Path(cfg.exp_dir) / "ckpt.pt"
+            ckpt.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model": model.state_dict(),
+                "decoder": decoder.state_dict(),
+                "decoder_optimizer": decoder_optimizer.state_dict(),
+                "cfg": cfg.to_dict(),
+                "epoch": epoch,
+            }, ckpt)
+            step += 0  # step unchanged; no eval this epoch
+            continue
+
         model.eval()
         eval_metrics: dict[str, float] = {}
         n = 0
@@ -356,6 +411,36 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
             f"k_used={eval_metrics.get('eval/k_used_mean', 0):.1f} "
             f"probe_r2={eval_metrics.get('eval/probe/r2', 0):.3f}"
         )
+
+        # Render + log deliberation/rollout gifs to Aim. Dense early (every
+        # epoch through the curriculum ramp), sparse once training plateaus.
+        # Cadence scales with total epochs (see _should_render_gifs).
+        if _should_render_gifs(epoch, cfg.epochs):
+            try:
+                # Pull one dev batch for visualization. Reuse the first batch
+                # by re-iterating; eval was in the same model.eval() context.
+                eval_iter = iter(loaders["dev"])
+                viz_batch = next(eval_iter)
+                gif_dir = Path(cfg.exp_dir) / "gifs"
+                gifs = render_rollout_for_eval(
+                    model, decoder, viz_batch, cfg, gif_dir, sample_idx=0
+                )
+                logger.log_image(
+                    "gif/deliberation",
+                    gifs["deliberation_frames"],
+                    step=step,
+                    context={"subset": "gifs"},
+                    caption=f"deliberation ep{epoch}",
+                )
+                logger.log_image(
+                    "gif/rollout",
+                    gifs["rollout_img"],
+                    step=step,
+                    context={"subset": "gifs"},
+                    caption=f"rollout ep{epoch}",
+                )
+            except Exception as e:
+                print(f"Gif render skipped: {e}")
 
         # checkpoint (model + decoder + decoder optimizer)
         ckpt = Path(cfg.exp_dir) / "ckpt.pt"

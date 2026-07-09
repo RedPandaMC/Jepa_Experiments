@@ -1,5 +1,6 @@
-"""Convert Kubric MOVi tfds shards to the RD-JEPA v3 .npz transition cache.
+"""Easy data generation for RD-JEPA v2 (MOVi-A cache builder).
 
+Converts Kubric MOVi tfds shards to the RD-JEPA v3 .npz transition cache.
 This runs entirely in the main Python 3.11 env — no TensorFlow, no second
 Python version. MOVi tfds shards are plain `tf.Example` records in .tfrecord
 containers hosted on the public GCS bucket `gs://kubric-public/tfds/...`.
@@ -17,23 +18,24 @@ Cache v3 format (per .npz shard):
     version        ()           int64    3
 
 Usage:
-    # Smoke test: download one train shard, parse, emit a tiny dev shard.
-    uv run python scripts/convert_movi.py --smoke
+    # Easy way (recommended): builds train + dev with recommended defaults
+    # (50 train shards, force-scale 1.0, 64x64 frames) for an 8 GB laptop.
+    uv run python scripts/build_data.py
+    uv run python scripts/build_data.py --max-shards 10   # quick test
+    uv run python scripts/build_data.py --dev-only         # just the dev split
+    uv run python scripts/build_data.py --scan-scale       # tune force-scale
 
-    # Estimate a good --force-scale (scans collisions only, no frame decode).
-    uv run python scripts/convert_movi.py --scan-scale --max-shards 20
-
-    # Full train conversion (downsamples to 64x64).
-    uv run python scripts/convert_movi.py --split train --out-split train
-
-    # Validation -> dev shard.
-    uv run python scripts/convert_movi.py --tfds-split validation --out-split dev
+    # Full control (single split, custom params):
+    uv run python scripts/build_data.py --tfds-split train --out-split train --force-scale 1.0
+    uv run python scripts/build_data.py --tfds-split validation --out-split dev
 """
 from __future__ import annotations
 
 import argparse
 import io
 import json
+import time
+import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
@@ -93,24 +95,56 @@ def list_shards(variant: str, resolution: int, tfds_split: str) -> list[str]:
     return [n for n in names if want in n and f"-{tfds_split}." in n]
 
 
-def download(url: str, dest: Path) -> None:
-    """Download `url` to `dest` with a tqdm progress bar (resume-aware)."""
+def download(url: str, dest: Path, max_retries: int = 6) -> None:
+    """Download `url` to `dest` with retries + HTTP Range resume.
+
+    A timeout or connection drop mid-stream is recovered from: the partial
+    `.part` file is kept, and on retry an HTTP `Range:` header resumes from
+    the bytes already on disk. After all retries are exhausted the `.part`
+    file is removed so a fresh run starts clean.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         return
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url, timeout=120) as r:
-        total = int(r.headers.get("Content-Length", 0))
-        with open(tmp, "wb") as f, tqdm(
-            total=total, unit="B", unit_scale=True, desc=dest.name, leave=False
-        ) as bar:
-            while True:
-                chunk = r.read(1 << 20)  # 1 MiB
-                if not chunk:
-                    break
-                f.write(chunk)
-                bar.update(len(chunk))
-    tmp.replace(dest)
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        have = tmp.stat().st_size if tmp.exists() else 0
+        headers = {"Range": f"bytes={have}-"} if have else {}
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                # If the server ignored Range (status 200 vs 206), restart.
+                if have and r.status == 200:
+                    have = 0
+                    mode = "wb"
+                else:
+                    mode = "ab"
+                total = int(r.headers.get("Content-Length", 0)) + have
+                with open(tmp, mode) as f, tqdm(
+                    total=total, initial=have, unit="B", unit_scale=True,
+                    desc=dest.name, leave=False,
+                ) as bar:
+                    while True:
+                        try:
+                            chunk = r.read(1 << 20)  # 1 MiB
+                        except (TimeoutError, ConnectionError) as e:
+                            last_exc = e
+                            raise  # caught by outer try, triggers retry
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            tmp.replace(dest)
+            return
+        except (TimeoutError, ConnectionError, urllib.error.URLError) as e:
+            last_exc = e
+            print(f"  download retry {attempt}/{max_retries} for {dest.name}: {e}")
+            time.sleep(min(2 ** attempt, 30))
+            continue
+    if tmp.exists():
+        tmp.unlink()
+    raise RuntimeError(f"failed to download {url} after {max_retries} retries: {last_exc}")
 
 
 def iter_examples(tfrecord_path: Path) -> Iterator[example_pb2.Example]:
@@ -193,6 +227,17 @@ def emit_shard(
     print(f"  wrote {out_path.name}: {len(s_t)} transitions")
 
 
+def _downsample(video: np.ndarray, size: int) -> np.ndarray:
+    """[T, H, W, 3] uint8 -> [T, size, size, 3] uint8 via PIL bilinear per frame."""
+    out = np.empty((video.shape[0], size, size, 3), dtype=np.uint8)
+    for i, frame in enumerate(video):
+        out[i] = np.asarray(
+            Image.fromarray(frame, mode="RGB").resize((size, size), Image.BILINEAR),
+            dtype=np.uint8,
+        )
+    return out
+
+
 def convert_split(
     variant: str,
     resolution: int,
@@ -266,17 +311,6 @@ def convert_split(
     )
 
 
-def _downsample(video: np.ndarray, size: int) -> np.ndarray:
-    """[T, H, W, 3] uint8 -> [T, size, size, 3] uint8 via PIL bilinear per frame."""
-    out = np.empty((video.shape[0], size, size, 3), dtype=np.uint8)
-    for i, frame in enumerate(video):
-        out[i] = np.asarray(
-            Image.fromarray(frame, mode="RGB").resize((size, size), Image.BILINEAR),
-            dtype=np.uint8,
-        )
-    return out
-
-
 def scan_scale(
     variant: str,
     resolution: int,
@@ -310,66 +344,96 @@ def scan_scale(
           f"(clamps 99%% of windows to <=1.0)")
 
 
-def smoke(out_dir: Path) -> None:
-    """Download one train shard, parse a few videos, emit a tiny dev shard."""
-    print("SMOKE: downloading one movi_a train shard and parsing...")
-    convert_split(
-        variant="movi_a",
-        resolution=128,
-        tfds_split="train",
-        out_split="smoke",
-        out_dir=out_dir,
-        frame_size=64,
-        lookahead=3,
-        force_scale=50000.0,
-        max_shards=1,
-        max_videos=5,
-        shard_size=100000,
-    )
-
-
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Easy-mode flags (recommended defaults for an 8 GB laptop).
+    p.add_argument("--max-shards", type=int, default=50,
+                   help="cap train shards (default 50; bound work for an 8GB laptop)")
+    p.add_argument("--force-scale", type=float, default=1.0,
+                   help="collision-force divisor (run --scan-scale to tune)")
+    p.add_argument("--frame-size", type=int, default=256,
+                   help="downsample frames to this resolution (default 256)")
+    p.add_argument("--dev-only", action="store_true",
+                   help="only build the dev (validation) split")
+    p.add_argument("--scan-scale", action="store_true",
+                   help="scan collisions to estimate --force-scale, then exit")
+    # Full-control flags (override the easy defaults for a single split).
     p.add_argument("--variant", default="movi_a")
     p.add_argument("--resolution", type=int, default=128, choices=(128, 256))
-    p.add_argument("--tfds-split", default="train", help="tfds split to download")
-    p.add_argument("--out-split", default="train", help="npz shard name suffix")
-    p.add_argument("--out-dir", default="data/cache", type=Path)
-    p.add_argument("--frame-size", type=int, default=64)
+    p.add_argument("--tfds-split", default=None,
+                   help="tfds split to download (single-split mode; "
+                        "if set, skips the easy train+dev flow)")
+    p.add_argument("--out-split", default=None,
+                   help="npz shard name suffix (single-split mode)")
     p.add_argument("--lookahead", type=int, default=3)
-    p.add_argument("--force-scale", type=float, default=50000.0,
-                   help="divisor for raw collision-force sums (MOVi forces are ~1e4-1e5; "
-                        "use --scan-scale to tune)")
-    p.add_argument("--max-shards", type=int, default=None)
-    p.add_argument("--max-videos", type=int, default=None)
     p.add_argument("--shard-size", type=int, default=1000,
                    help="approx transitions per emitted .npz shard")
-    p.add_argument("--scan-scale", action="store_true",
-                   help="scan collisions only and report a suggested --force-scale")
-    p.add_argument("--smoke", action="store_true",
-                   help="one-shard sanity check (parses 5 videos, writes a smoke shard)")
+    p.add_argument("--max-videos", type=int, default=None)
     args = p.parse_args()
 
-    if args.smoke:
-        smoke(args.out_dir)
-        return
-    if args.scan_scale:
-        scan_scale(args.variant, args.resolution, args.tfds_split,
-                   args.lookahead, args.max_shards or 20, args.out_dir)
-        return
-    convert_split(
+    out_dir = Path("data/cache")
+    common = dict(
         variant=args.variant,
         resolution=args.resolution,
-        tfds_split=args.tfds_split,
-        out_split=args.out_split,
-        out_dir=args.out_dir,
+        out_dir=out_dir,
         frame_size=args.frame_size,
         lookahead=args.lookahead,
         force_scale=args.force_scale,
-        max_shards=args.max_shards,
-        max_videos=args.max_videos,
-        shard_size=args.shard_size,
     )
+
+    if args.scan_scale:
+        scan_scale(
+            variant=common["variant"],
+            resolution=common["resolution"],
+            tfds_split="train",
+            lookahead=common["lookahead"],
+            max_shards=20,
+            out_dir=out_dir,
+        )
+        return
+
+    # Single-split full-control mode: --tfds-split bypasses the easy flow.
+    if args.tfds_split is not None:
+        convert_split(
+            tfds_split=args.tfds_split,
+            out_split=args.out_split or args.tfds_split,
+            max_shards=args.max_shards if args.tfds_split == "train" else None,
+            max_videos=args.max_videos,
+            shard_size=args.shard_size,
+            **common,
+        )
+        return
+
+    if not args.dev_only:
+        print("=" * 60)
+        print(f"Building TRAIN cache (max {args.max_shards} shards)...")
+        print("=" * 60)
+        convert_split(
+            tfds_split="train",
+            out_split="train",
+            max_shards=args.max_shards,
+            shard_size=args.shard_size,
+            **common,
+        )
+
+    print("=" * 60)
+    print("Building DEV cache (validation split)...")
+    print("=" * 60)
+    convert_split(
+        tfds_split="validation",
+        out_split="dev",
+        max_shards=None,
+        shard_size=args.shard_size,
+        **common,
+    )
+
+    print("\nDone. Cache files:")
+    import glob
+    for f in sorted(glob.glob("data/cache/movi_a_*.npz")):
+        print(f"  {f}")
 
 
 if __name__ == "__main__":

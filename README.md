@@ -193,26 +193,29 @@ MOVi-A tfds shards are parsed with the pure-Python `tfrecord` package and
 emitted as v3 `.npz` caches (RGB frames + `violation_gt`).
 
 ```bash
-# Smoke test the parser: 1 shard, 5 videos, tiny npz.
-uv run python scripts/convert_movi.py --smoke
+# Easy way (recommended): builds train + dev with recommended defaults
+# (50 train shards, force-scale 1.0, 256x256 frames) for an 8 GB laptop.
+uv run python scripts/build_data.py
+uv run python scripts/build_data.py --max-shards 10   # quick test
+uv run python scripts/build_data.py --dev-only         # just the dev split
+uv run python scripts/build_data.py --scan-scale        # tune force-scale
 
-# (Optional) estimate --force-scale from collision-force percentiles.
-uv run python scripts/convert_movi.py --scan-scale --max-shards 20
-
-# Build train cache (downsamples to 64x64).
-uv run python scripts/convert_movi.py --split train --out-split train --force-scale 1.0
-
-# Build dev cache from MOVi's validation split.
-uv run python scripts/convert_movi.py --tfds-split validation --out-split dev
+# Full control (single split, custom params): see scripts/build_data.py --help
+uv run python scripts/build_data.py --tfds-split train --out-split train --force-scale 1.0
+uv run python scripts/build_data.py --tfds-split validation --out-split dev
 ```
 
 ### 4.3 Training
 
 ```bash
-# Library entry point (the K=15 alias was removed in v2 — use K_max).
-uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import train; train(Config(exp_name='default', K_max=15, epochs=20))"
+# Easy way (recommended): every Config field is a CLI override (kebab-case).
+# The full config is printed before training starts. Run with --help to see
+# all options.
+uv run python scripts/train.py
+uv run python scripts/train.py --exp-name big --epochs 40 --batch-size 256
+uv run python scripts/train.py --fast    # 500-sample smoke test
 
-# Metrics dashboard
+# Metrics + gif dashboard
 uv run aim up
 ```
 
@@ -244,7 +247,9 @@ rd_jepa/
     ├── decoder.py         VizDecoder + make_decoder_optimizer (async probing)
     ├── gif_writer.py      deliberation + rollout gif rendering
     └── aim_logger.py      Aim scalar/image logging
-scripts/convert_movi.py    MOVi tfds -> .npz cache (v3 format)
+scripts/
+├── build_data.py          MOVi tfds -> .npz cache (v3 format) + easy CLI
+└── train.py               easy training entry point (all Config fields as CLI flags)
 tests/test_movi_pipeline.py  14 tests: data + model + losses + decoder contract
 docs/
 ├── architecture.tex       Figure 1 source (TikZ)

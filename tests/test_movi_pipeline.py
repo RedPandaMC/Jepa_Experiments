@@ -101,7 +101,7 @@ def test_loader_rejects_v2_cache(tmp_path):
     try:
         MoviTransitionDataset(path)
     except RuntimeError as e:
-        assert "v3" in str(e).lower() or "convert_movi" in str(e).lower()
+        assert "v3" in str(e).lower() or "build_data" in str(e).lower()
     else:
         raise AssertionError("v2 cache should be rejected")
 
