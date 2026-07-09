@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 dist/
 build/
 
@@ -15,12 +18,18 @@ build/
 # Runs / artifacts (regenerated locally; keep the data cache)
 runs/
 *.gif
-*.png
 !runs/smoke/*.png
 
 # PhyRE venv (in-repo, gitignored — 400MB of binary wheels)
 .phyre39/
 phyre39/
+
+# LaTeX build artifacts (keep sources + rendered pdf/png/svg)
+docs/*.aux
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.log
+docs/build.log
 
 # IDE
 .idea/

@@ -1,0 +1,10 @@
+# Normalize text files to LF in the repo; check out as-is locally.
+* text=auto eol=lf
+
+# Binary assets — never diff/merge as text
+*.png binary
+*.jpg binary
+*.pdf binary
+*.gif binary
+*.npz binary
+*.pt binary
