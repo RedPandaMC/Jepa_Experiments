@@ -20,6 +20,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
+    "mypy>=1.0",
 ]
 
 [tool.uv]
@@ -49,3 +50,10 @@ select = ["E", "F", "I", "W", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Gradual adoption - start permissive
+ignore_missing_imports = true  # For torch, phyre, etc.
