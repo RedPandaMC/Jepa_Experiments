@@ -70,6 +70,25 @@ def violation_aux_loss(
     return torch.relu(diffs).mean()
 
 
+def violation_supervision_loss(
+    violations: torch.Tensor,  # [K, B]
+    all_h: torch.Tensor,  # [K, B, d]
+    target: torch.Tensor,  # [B, d]
+) -> torch.Tensor:
+    """Train V_psi to predict its own residual error to the true target.
+
+    The supervision signal is the per-sample, per-step squared distance from
+    h_k to the (stop-grad) target. This teaches the violation head to report
+    how far the lens still is from being in focus, so the early-exit
+    threshold tau is meaningful. No extra labels needed.
+    """
+    # [K, B] squared error per step
+    with torch.no_grad():
+        err = (all_h - target.unsqueeze(0)).pow(2).sum(dim=-1)  # [K, B]
+        err = err / err.max().clamp(min=1e-6)  # normalize to ~[0,1]
+    return torch.nn.functional.mse_loss(violations, err)
+
+
 def total_loss(
     all_h: torch.Tensor,
     h_final: torch.Tensor,
@@ -77,14 +96,21 @@ def total_loss(
     violations: torch.Tensor,
     cfg: Config,
     violation_weight: float = 0.01,
+    violation_supervision_weight: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Total RD-JEPA loss + a dict of metric names for logging."""
     l_traj = trajectory_loss(all_h, target, cfg)
     l_viol = violation_aux_loss(violations)
-    total = l_traj + violation_weight * l_viol
+    l_viol_sup = violation_supervision_loss(violations, all_h, target)
+    total = (
+        l_traj
+        + violation_weight * l_viol
+        + violation_supervision_weight * l_viol_sup
+    )
     metrics = {
         "loss/total": total.detach().float().item(),
         "loss/trajectory": l_traj.detach().float().item(),
         "loss/violation_aux": l_viol.detach().float().item(),
+        "loss/violation_supervision": l_viol_sup.detach().float().item(),
     }
     return total, metrics
