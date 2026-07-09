@@ -106,23 +106,30 @@ def write_rollout_gif(
 def render_rollout_for_eval(
     model,
     decoder,
-    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     cfg: Config,
     out_dir: Path,
     sample_idx: int = 0,
 ) -> dict[str, Path]:
-    """Run the model on one batch and render both gif types for sample_idx."""
+    """Run the model on one batch and render both gif types for sample_idx.
+
+    v2 batch format: (context[2,H,W], action[3], target[2,H,W], solved[bool]).
+    For visualization, we display the second channel of target (s_{t+1}) as GT.
+    """
     out_dir = Path(out_dir)
-    s_t, action, s_tp1 = batch
-    s_t = s_t.cuda()
+    # v2: context is 2-channel stack (s_{t-1}, s_t), target is (s_t, s_{t+1})
+    s_context, action, s_target, _solved = batch
+    s_context = s_context.cuda()
     action = action.cuda()
-    s_tp1 = s_tp1.cuda()
+    s_target = s_target.cuda()
     with torch.no_grad():
-        out = model(s_t, action, K=cfg.K, early_exit=cfg.early_exit, tau=cfg.violation_tau)
+        out = model(s_context, action, K=cfg.K, early_exit=cfg.early_exit, tau=cfg.violation_tau)
+    # For GT visualization, use the second channel of target (s_{t+1})
+    gt_frame = s_target[sample_idx, 1:2, :, :]  # [1, H, W]
     deliberation = write_deliberation_gif(
         out["all_h"], decoder, sample_idx, out_dir / f"deliberation_{sample_idx}.gif"
     )
     rollout = write_rollout_gif(
-        out["h_K"][sample_idx], s_tp1[sample_idx], decoder, out_dir / f"rollout_{sample_idx}.gif"
+        out["h_K"][sample_idx], gt_frame, decoder, out_dir / f"rollout_{sample_idx}.gif"
     )
     return {"deliberation": deliberation, "rollout": rollout}

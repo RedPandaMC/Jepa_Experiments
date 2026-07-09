@@ -4,6 +4,9 @@ Implements the Lens Paradigm (spec §2.2): a single shared refinement
 function $F_\\theta$ is applied K times to iteratively focus the latent
 until it is physically sharp. Weight sharing keeps VRAM flat in K.
 
+Cache v2 input: 2-channel stacked frames (s_{t-1}, s_t) for context and
+(s_t, s_{t+1}) for target, providing velocity information.
+
 The loop returns:
   - h_K: the final (or early-exited) latent per sample.
   - k_used: per-sample number of steps actually taken (<= K).
@@ -30,7 +33,9 @@ class RDJEPA(nn.Module):
         spatial = cfg.latent_shape.value == "spatial"
         d = cfg.latent_total_dim
 
+        # v2: 2-channel input (frame stack for velocity)
         self.encoder = Encoder(
+            in_channels=2,
             channels=cfg.encoder_channels,
             latent_dim=cfg.latent_dim,
             spatial=spatial,
@@ -51,6 +56,9 @@ class RDJEPA(nn.Module):
             gate=cfg.gate.value,
         )
         self.violation = ViolationHead(latent_dim=d, hidden_dim=d)
+
+        # Optional LayerNorm on encoder output for training stability
+        self.latent_norm = nn.LayerNorm(d) if cfg.latent_layernorm else nn.Identity()
 
         # EMA target encoder (not trained by gradients)
         self.target_encoder = EMATargetEncoder(self.encoder, decay=cfg.ema_decay)
@@ -86,7 +94,7 @@ class RDJEPA(nn.Module):
 
     def forward(
         self,
-        s_t: torch.Tensor,
+        s_context: torch.Tensor,
         action: torch.Tensor,
         K: int | None = None,
         early_exit: bool = False,
@@ -96,7 +104,7 @@ class RDJEPA(nn.Module):
         """Run the deliberation loop.
 
         Args:
-            s_t: [B, 1, H, W] current frame.
+            s_context: [B, 2, H, W] stacked context frames (s_{t-1}, s_t).
             action: [B, 3] raw action.
             K: override cfg.K if set.
             early_exit: enable per-sample early exit on violation < tau.
@@ -104,10 +112,11 @@ class RDJEPA(nn.Module):
             use_checkpoint: gradient-checkpoint each lens step.
         """
         K = K if K is not None else self.cfg.K
-        B = s_t.shape[0]
-        device = s_t.device
+        B = s_context.shape[0]
+        device = s_context.device
 
-        h = self._flatten(self.encoder(s_t))
+        h = self._flatten(self.encoder(s_context))
+        h = self.latent_norm(h)
         a_enc = self.action_encoder(action)  # [B, d]
 
         all_h = []
@@ -145,7 +154,11 @@ class RDJEPA(nn.Module):
             "violations": torch.stack(all_v, dim=0),  # [K, B]
         }
 
-    def target(self, s_tp1: torch.Tensor) -> torch.Tensor:
-        """Stop-gradient target latent from the EMA encoder (for the loss)."""
+    def target(self, s_target: torch.Tensor) -> torch.Tensor:
+        """Stop-gradient target latent from the EMA encoder (for the loss).
+
+        Args:
+            s_target: [B, 2, H, W] stacked target frames (s_t, s_{t+1}).
+        """
         with torch.no_grad():
-            return self._flatten(self.target_encoder(s_tp1))
+            return self._flatten(self.target_encoder(s_target))

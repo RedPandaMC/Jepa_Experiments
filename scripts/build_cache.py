@@ -5,10 +5,17 @@ Runs under the dedicated PhyRE (Python 3.9) venv — see
 rd_jepa/data/phyre_env.py. Produces per-fold shards containing state
 transitions (s_t, action, s_{t+1}) suitable for JEPA training.
 
-Each simulation produces `n_frames` evenly-spaced frames. We extract
-consecutive-frame pairs as transitions, downsample to frame_size, and
-store the raw uint8 scene-id maps (NOT RGB) — the encoder consumes the
-scene-id channel directly, which preserves object identity.
+Each simulation produces `n_frames` evenly-spaced frames. We emit
+transitions `(s_{t-1}, s_t, a_t, s_{t+1}, solved)` — i.e. frame-stacked
+context so the model observes velocity, not just position. `solved` is
+the PhyRE rollout's solve status, broadcast to every transition from
+that rollout (a grounded downstream signal for the violation head and
+the linear probe). `action` is the initial placement that produced the
+rollout. We downsample to frame_size and store raw uint8 scene-id maps
+(NOT RGB) — the encoder consumes the scene-id channel directly, which
+preserves object identity.
+
+Cache version 2 adds: `s_tm1` (previous frame) and `solved` (bool).
 
 Usage:
     <phyre39>/bin/python scripts/build_cache.py --tier ball_cross_template --fold 0
@@ -22,7 +29,7 @@ import numpy as np
 import phyre
 from tqdm import tqdm
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def downsample(frames: np.ndarray, size: int) -> np.ndarray:
@@ -41,6 +48,17 @@ def downsample(frames: np.ndarray, size: int) -> np.ndarray:
     return out
 
 
+def _is_solved(status) -> bool:
+    """Map a PhyRE SimulationStatus to a solved bool.
+
+    PhyRE's status enum exposes the outcome of an action; we treat the
+    SOLVED outcome as True. The enum is ABI-locked and its exact int
+    mapping can vary, so we rely on the `.name` string defensively.
+    """
+    name = getattr(status, "name", str(status)).upper()
+    return "SOLVED" in name and "NOT" not in name
+
+
 def build_cache(
     tier: str = "ball_cross_template",
     fold: int = 0,
@@ -51,6 +69,8 @@ def build_cache(
     seed: int = 42,
     fast: bool = False,
     stride: int = 10,
+    worker_id: int = 0,
+    n_workers: int = 1,
 ) -> int:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -62,38 +82,54 @@ def build_cache(
 
     action_mapper = phyre.action_mappers.get_action_mapper(tier.split("_")[0])
 
+    # Parallelization: each worker handles a strided slice of task_ids and
+    # tags its output shards with _w{id} so concurrent writes don't collide.
+    # The dataset loader globs `{stem}_shard*.npz`, which matches the
+    # `_w{id}` suffix, so per-worker shards are picked up transparently.
+    w_tag = f"_w{worker_id}" if n_workers > 1 else ""
+
     total_pairs = 0
     for split_name, task_ids in splits.items():
+        # full list kept for the manifest (only worker 0 writes it).
+        full_task_ids = task_ids
+        if n_workers > 1:
+            task_ids = task_ids[worker_id::n_workers]
         print(f"[{split_name}] {len(task_ids)} tasks, {n_actions} actions/task")
 
         # Re-initialize the simulator per shard to bound memory (phyre leaks
         # internal state per task; initializing all 1600 at once OOMs on 8GB).
         shard_size = 200
 
+        s_tm1_list: list[np.ndarray] = []
         s_t_list: list[np.ndarray] = []
         a_list: list[np.ndarray] = []
         s_tp1_list: list[np.ndarray] = []
+        solved_list: list[np.ndarray] = []
 
         def flush_shard(shard_idx: int) -> int:
-            nonlocal s_t_list, a_list, s_tp1_list
+            nonlocal s_tm1_list, s_t_list, a_list, s_tp1_list, solved_list
             if not s_t_list:
                 return 0
+            s_tm1 = np.stack(s_tm1_list)
             s_t = np.stack(s_t_list)
             a = np.stack(a_list)
             s_tp1 = np.stack(s_tp1_list)
-            out_path = out_dir / f"{tier}_fold{fold}_{split_name}_shard{shard_idx}.npz"
+            solved = np.stack(solved_list)
+            out_path = out_dir / f"{tier}_fold{fold}_{split_name}_shard{shard_idx}{w_tag}.npz"
             np.savez_compressed(
                 out_path,
+                s_tm1=s_tm1,
                 s_t=s_t,
                 action=a,
                 s_tp1=s_tp1,
+                solved=solved,
                 frame_size=frame_size,
                 version=CACHE_VERSION,
             )
             mb = out_path.stat().st_size / 1e6
             print(f"  shard {shard_idx}: {s_t.shape[0]} pairs, {mb:.1f} MB -> {out_path.name}")
             n = s_t.shape[0]
-            s_t_list, a_list, s_tp1_list = [], [], []
+            s_tm1_list, s_t_list, a_list, s_tp1_list, solved_list = [], [], [], [], []
             return n
 
         shard_idx = 0
@@ -114,26 +150,42 @@ def build_cache(
                         continue
 
                     imgs = res.images
-                    if imgs.shape[0] < 2:
+                    if imgs.shape[0] < 3:
+                        # need >=3 frames so we have at least one
+                        # (s_{t-1}, s_t, s_{t+1}) triple after subsampling.
                         continue
 
                     idx = np.linspace(0, imgs.shape[0] - 1, n_frames).astype(int)
                     frames = imgs[idx]
                     frames_ds = downsample(frames, frame_size)
 
-                    for j in range(n_frames - 1):
+                    # PhyRE status: SOLVED if the action solved the task.
+                    # res.status is a SimulationStatus enum; its int value
+                    # encodes SOLVED (0 typically means not solved, but the
+                    # enum is the reliable source — use the .is_solved if
+                    # available, else check name == 'SOLVED').
+                    solved = _is_solved(res.status)
+                    solved_arr = np.array(solved, dtype=bool)
+
+                    # Emit transitions starting at j=1 so every pair has a
+                    # genuine previous frame (s_tm1) for velocity context.
+                    for j in range(1, n_frames - 1):
+                        s_tm1_list.append(frames_ds[j - 1])
                         s_t_list.append(frames_ds[j])
                         a_list.append(action.astype(np.float32))
                         s_tp1_list.append(frames_ds[j + 1])
+                        solved_list.append(solved_arr)
 
             # flush after each shard and release the simulator
             total_pairs += flush_shard(shard_idx)
             shard_idx += 1
             del sim
 
-        # write the task_ids manifest for this split
-        manifest_path = out_dir / f"{tier}_fold{fold}_{split_name}_manifest.txt"
-        manifest_path.write_text("\n".join(task_ids), encoding="utf-8")
+        # write the task_ids manifest for this split (only from worker 0 so we
+        # don't get partial/colliding writes; use the full unsliced list).
+        if worker_id == 0:
+            manifest_path = out_dir / f"{tier}_fold{fold}_{split_name}_manifest.txt"
+            manifest_path.write_text("\n".join(full_task_ids), encoding="utf-8")
 
     print(f"\nDone: {total_pairs} transitions cached (sharded).")
     return 0
@@ -150,6 +202,14 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fast", action="store_true", help="50-task subset for ablations")
     p.add_argument("--stride", type=int, default=10, help="frame subsample stride")
+    p.add_argument(
+        "--worker-id", type=int, default=0,
+        help="worker rank for parallel build (0..n-workers-1)"
+    )
+    p.add_argument(
+        "--n-workers", type=int, default=1,
+        help="number of parallel workers (shards get _w{id} suffix)"
+    )
     args = p.parse_args()
 
     return build_cache(
@@ -162,6 +222,8 @@ def main() -> int:
         seed=args.seed,
         fast=args.fast,
         stride=args.stride,
+        worker_id=args.worker_id,
+        n_workers=args.n_workers,
     )
 
 

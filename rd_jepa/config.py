@@ -56,6 +56,7 @@ class Config:
     K: int = 15
     early_exit: bool = True
     violation_tau: float = 0.1  # early-exit threshold on V_psi
+    latent_layernorm: bool = True  # LayerNorm on encoder output before deliberation
 
     # --- training ---
     batch_size: int = 32
@@ -68,9 +69,16 @@ class Config:
     ema_decay: float = 0.996
     ema_warmup: int = 100
 
+    # --- LR schedule ---
+    lr_warmup_steps: int = 500  # linear warmup steps
+    lr_cosine: bool = True  # use cosine decay after warmup
+
     # --- loss ---
     loss_trajectory: LossTrajectory = LossTrajectory.DISCOUNTED
     gamma: float = 0.7  # discount for discounted loss
+
+    # --- VICReg collapse prevention ---
+    vicreg_target_std: float = 1.0  # target std per dimension for variance loss
 
     # --- experiment ---
     exp_name: str = "default"

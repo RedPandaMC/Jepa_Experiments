@@ -38,10 +38,11 @@ class DepthwiseBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """E_\\theta: [B, 1, 64, 64] -> [B, latent_dim] (flat) or [B, C, 4, 4] (spatial)."""
+    """E_\\theta: [B, in_channels, 64, 64] -> [B, latent_dim] (flat) or [B, C, 4, 4] (spatial)."""
 
     def __init__(
         self,
+        in_channels: int = 2,
         channels: tuple[int, ...] = (32, 64, 128, 256),
         latent_dim: int = 256,
         spatial: bool = False,
@@ -53,7 +54,7 @@ class Encoder(nn.Module):
         self.latent_channels = latent_channels
 
         self.blocks = nn.ModuleList()
-        in_ch = 1
+        in_ch = in_channels
         for ch in channels:
             self.blocks.append(ConvBlock(in_ch, ch, stride=2))
             in_ch = ch

@@ -50,9 +50,13 @@ def main() -> int:
     model.eval()
 
     decoder = VizDecoder(latent_dim=cfg.latent_total_dim).cuda()
-    # the decoder is not trained in this POC; it still produces visible frames
-    # via its random init, which is enough to demonstrate the gif pipeline.
-
+    # Load trained decoder if available, otherwise use random init
+    if "decoder" in ckpt:
+        decoder.load_state_dict(ckpt["decoder"])
+        print("Loaded trained decoder from checkpoint")
+    else:
+        print("Warning: No trained decoder in checkpoint, using random init")
+    decoder.eval()
     loaders = build_dataloaders(cfg)
     batch = next(iter(loaders["dev"]))
     out_dir = exp_dir / "gifs"
