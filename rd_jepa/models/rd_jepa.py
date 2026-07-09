@@ -1,4 +1,4 @@
-r"""Top-level RD-JEPA model: encode -> K-step lens refinement -> early exit.
+r"""Top-level RD-JEPA v2 model: encode -> K-step lens refinement -> early exit.
 
 Implements the Lens Paradigm (spec §2.2): a single shared refinement
 function $F_\theta$ is applied K times to iteratively focus the latent
@@ -8,10 +8,14 @@ Cache v3 input (MOVi): two stacked RGB frames (s_{t-1}, s_t) for context
 and (s_t, s_{t+1}) for target, providing velocity information. There is no
 action modality in MOVi, so the lens refines a purely visual latent.
 
+The latent is always spatial ([B, latent_channels, 4, 4] -> flat d for the
+deliberation MLPs) so the divergence-projection mask (v2 core fix #2) has
+spatial axes to operate on.
+
 The loop returns:
   - h_K: the final (or early-exited) latent per sample.
   - k_used: per-sample number of steps actually taken (<= K).
-  - all_h: stack of intermediate latents [K, B, d] for the discounted loss.
+  - all_h: stack of intermediate latents [K, B, d] (energy/contrastive/div losses).
   - violations: [K, B] violation scores at each step (for early exit + aux loss).
 """
 from __future__ import annotations
@@ -30,26 +34,22 @@ class RDJEPA(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        spatial = cfg.latent_shape.value == "spatial"
         d = cfg.latent_total_dim
 
-        # v3: stacked RGB frames (s_{t-1}, s_t) -> 2 * img_channels input
+        # v3: stacked RGB frames (s_{t-1}, s_t) -> 2 * img_channels input.
+        # Spatial latent is the only path in v2 (divergence mask needs it).
         self.encoder = Encoder(
             in_channels=cfg.encoder_in_channels,
             channels=cfg.encoder_channels,
-            latent_dim=cfg.latent_dim,
-            spatial=spatial,
             latent_channels=cfg.latent_channels,
         )
-        # If spatial, flatten the [C,4,4] latent for the deliberation MLPs and
-        # reshape back for the target loss. Flat path is the default POC config.
-        self.spatial = spatial
+        self.spatial = True
         self.flat_dim = d
 
         self.lens = DeliberationStep(
             latent_dim=d,
             hidden_dim=cfg.hidden_dim,
-            gate=cfg.gate.value,
+            latent_channels=cfg.latent_channels,
         )
         self.violation = ViolationHead(latent_dim=d, hidden_dim=d)
 
@@ -97,12 +97,12 @@ class RDJEPA(nn.Module):
         Args:
             s_context: [B, C_in, H, W] stacked context frames (s_{t-1}, s_t).
                 C_in = 2 * img_channels (e.g. 6 for RGB).
-            K: override cfg.K if set.
+            K: override cfg.K_max if set (used by the curriculum schedule).
             early_exit: enable per-sample early exit on violation < tau.
             tau: violation threshold for early exit.
             use_checkpoint: gradient-checkpoint each lens step.
         """
-        K = K if K is not None else self.cfg.K
+        K = K if K is not None else self.cfg.K_max
         B = s_context.shape[0]
         device = s_context.device
 

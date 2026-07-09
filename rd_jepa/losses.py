@@ -1,18 +1,17 @@
-r"""Loss functions for RD-JEPA.
+r"""Loss functions for RD-JEPA v2.
 
-Implements spec §3.2:
-  1. Latent reconstruction loss (JEPA): MSE between h_final and the
-     stop-gradient EMA target encoder of s_{t+1}.
-  2. Optional contrastive/violation loss: penalize non-monotonic
-     violation trajectories (encourages the lens to focus faster).
-  3. VICReg-style variance + covariance regularization to prevent
-     representation collapse (safety net beyond EMA/stop-grad).
-  4. Grounded violation supervision: regress V_psi toward MOVi's
-     collision-force ground truth in the lookahead window.
-
-Support the Decision-3 ablation:
-  - 'final'     : loss only on h_K.
-  - 'discounted': discounted loss over all intermediate h_k with gamma.
+Spec §3.2 plus three core fixes:
+  1. Latent prediction loss (JEPA): MSE between h_K and the stop-gradient
+     EMA target encoder of s_{t+1}. Final-only (no discounted trajectory).
+  2. Violation losses: aux monotonicity + self-supervision + grounded
+     collision-force regression.
+  3. VICReg variance + covariance regularization (collapse safety net).
+  4. Energy conservation: penalize latent magnitude drift across the K loop
+     (physically forbids the subtractive phase from zeroing the state).
+  5. Contrastive dynamics: margin loss penalizing stasis (h_K ≈ h_0) when a
+     physical push (violation_gt > 0) was present.
+  6. Divergence regularization: penalize per-step latent mass change across
+     the K trajectory (constant-density / incompressibility proxy).
 """
 from __future__ import annotations
 
@@ -32,31 +31,6 @@ def latent_prediction_loss(
         target:  [B, d] stop-grad EMA target of s_{t+1}.
     """
     return torch.nn.functional.mse_loss(h_final, target)
-
-
-def trajectory_loss(
-    all_h: torch.Tensor,  # [K, B, d]
-    target: torch.Tensor,  # [B, d]
-    cfg: Config,
-) -> torch.Tensor:
-    """Loss over the K-step trajectory per the configured strategy.
-
-    'final'      -> loss on the last step only.
-    'discounted' -> sum_k gamma^{K-1-k} * loss(h_k) (later steps weighted more).
-    """
-    K = all_h.shape[0]
-    if cfg.loss_trajectory.value == "final":
-        return latent_prediction_loss(all_h[-1], target)
-    # discounted over all steps
-    losses = torch.stack(
-        [latent_prediction_loss(all_h[k], target) for k in range(K)]
-    )  # [K]
-    weights = torch.tensor(
-        [cfg.gamma ** (K - 1 - k) for k in range(K)],
-        device=all_h.device,
-        dtype=losses.dtype,
-    )
-    return (losses * weights).sum() / weights.sum()
 
 
 def violation_aux_loss(
@@ -141,6 +115,59 @@ def vicreg_covariance_loss(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     return (off_diag.pow(2)).sum() / d
 
 
+def energy_conservation_loss(all_h: torch.Tensor) -> torch.Tensor:
+    r"""Latent energy conservation: $| \|h_K\|_2 - \|h_0\|_2 |^2$.
+
+    Physically forbids the subtractive (divergence projection) phase from
+    zeroing out the latent state. If it subtracts overlapping momentum, it
+    must route that momentum somewhere else. Energy (magnitude) must be
+    conserved across the deliberation loop. Averaged over the batch.
+    """
+    h0 = all_h[0]  # [B, d]
+    hK = all_h[-1]  # [B, d]
+    n0 = torch.norm(h0, p=2, dim=-1)  # [B]
+    nK = torch.norm(hK, p=2, dim=-1)  # [B]
+    return ((nK - n0) ** 2).mean()
+
+
+def contrastive_dynamics_loss(
+    all_h: torch.Tensor,
+    violation_gt: torch.Tensor,
+    margin: float = 1.0,
+) -> torch.Tensor:
+    r"""Margin loss penalizing stasis when a physical push was present.
+
+    MOVi has no action modality, so "must make forward progress" is gated by
+    the grounded collision signal: when `violation_gt > 0` (a physical push
+    occurred in the lookahead window), the latent must move by at least
+    `margin` in L2 norm from h_0 to h_K. Scenes with no collision energy
+    are free to stay near h_0 (a quiet scene genuinely should not move).
+
+    L = mean_b [ ReLU(margin - ||h_K - h_0||_2) * 1[violation_gt_b > 0] ]
+    """
+    h0 = all_h[0]  # [B, d]
+    hK = all_h[-1]  # [B, d]
+    delta_norm = torch.norm(hK - h0, p=2, dim=-1)  # [B]
+    push = (violation_gt > 0.0).float()  # [B]
+    return (torch.relu(margin - delta_norm) * push).mean()
+
+
+def divergence_reg_loss(all_h: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    r"""Constant-density / incompressibility proxy across the K trajectory.
+
+    Penalizes change in latent mass (L2 norm) between consecutive steps.
+    Combined with the divergence projection in the lens, this encourages the
+    latent to behave like an incompressible fluid: mass may redistribute but
+    not be created or destroyed. Averaged over the K-1 inter-step transitions
+    and the batch.
+    """
+    if all_h.shape[0] < 2:
+        return torch.zeros((), device=all_h.device, dtype=all_h.dtype)
+    norms = torch.norm(all_h, p=2, dim=-1)  # [K, B]
+    diffs = (norms[1:] - norms[:-1]).abs()  # [K-1, B]
+    return diffs.mean()
+
+
 def total_loss(
     all_h: torch.Tensor,
     h_final: torch.Tensor,
@@ -148,43 +175,62 @@ def total_loss(
     violations: torch.Tensor,
     cfg: Config,
     violation_gt: torch.Tensor | None = None,
-    violation_weight: float = 0.01,
-    violation_supervision_weight: float = 0.1,
-    violation_grounded_weight: float = 0.1,
-    vicreg_var_weight: float = 1.0,
-    vicreg_cov_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Total RD-JEPA loss + a dict of metric names for logging."""
-    l_traj = trajectory_loss(all_h, target, cfg)
+    """Total RD-JEPA v2 loss + a dict of metric names for logging.
+
+    All loss weights are read from `cfg` (no hard-coded defaults here).
+    """
+    # JEPA core loss: final-only (no discounted trajectory in v2).
+    l_jepa = latent_prediction_loss(h_final, target)
+
+    # Violation losses.
     l_viol = violation_aux_loss(violations)
     l_viol_sup = violation_supervision_loss(violations, all_h, target)
-
-    # Grounded supervision using MOVi collision-force target (if provided)
     if violation_gt is not None:
         l_viol_ground = violation_grounded_loss(violations, violation_gt)
     else:
-        l_viol_ground = torch.zeros((), device=violations.device, dtype=violations.dtype)
+        l_viol_ground = torch.zeros(
+            (), device=violations.device, dtype=violations.dtype
+        )
 
-    # VICReg collapse-prevention (applied to final latent)
+    # VICReg collapse-prevention (applied to final latent).
     l_var = vicreg_variance_loss(h_final, target_std=cfg.vicreg_target_std)
     l_cov = vicreg_covariance_loss(h_final)
 
+    # v2 core fixes: energy conservation + contrastive dynamics + divergence.
+    l_energy = energy_conservation_loss(all_h)
+    if violation_gt is not None:
+        l_contrastive = contrastive_dynamics_loss(
+            all_h, violation_gt, margin=cfg.contrastive_margin
+        )
+    else:
+        l_contrastive = torch.zeros(
+            (), device=all_h.device, dtype=all_h.dtype
+        )
+    l_div = divergence_reg_loss(all_h)
+
     total = (
-        l_traj
-        + violation_weight * l_viol
-        + violation_supervision_weight * l_viol_sup
-        + violation_grounded_weight * l_viol_ground
-        + vicreg_var_weight * l_var
-        + vicreg_cov_weight * l_cov
+        l_jepa
+        + cfg.violation_weight * l_viol
+        + cfg.violation_supervision_weight * l_viol_sup
+        + cfg.violation_grounded_weight * l_viol_ground
+        + cfg.vicreg_var_weight * l_var
+        + cfg.vicreg_cov_weight * l_cov
+        + cfg.energy_weight * l_energy
+        + cfg.contrastive_weight * l_contrastive
+        + cfg.divergence_reg_weight * l_div
     )
     metrics = {
         "loss/total": total.detach().float().item(),
-        "loss/trajectory": l_traj.detach().float().item(),
+        "loss/jepa": l_jepa.detach().float().item(),
         "loss/violation_aux": l_viol.detach().float().item(),
         "loss/violation_supervision": l_viol_sup.detach().float().item(),
         "loss/violation_grounded": l_viol_ground.detach().float().item(),
         "loss/vicreg_variance": l_var.detach().float().item(),
         "loss/vicreg_covariance": l_cov.detach().float().item(),
+        "loss/energy": l_energy.detach().float().item(),
+        "loss/contrastive": l_contrastive.detach().float().item(),
+        "loss/divergence_reg": l_div.detach().float().item(),
         "repr/std_mean": h_final.std(dim=0).mean().detach().float().item(),
     }
     return total, metrics

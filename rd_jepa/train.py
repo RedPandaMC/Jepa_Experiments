@@ -1,19 +1,23 @@
-"""Training loop for RD-JEPA.
+"""Training loop for RD-JEPA v2.
 
 Implements spec §3.1 VRAM survival:
   - gradient checkpointing inside the K-loop (handled in the model)
   - bf16 autocast (Ampere-native)
-  - truncated BPTT: detach h every `tbptt_n` steps (handled here via the
-    model's loop, since we run the whole K-loop per batch; for the POC we
-    keep K<=15 which fits in 5.5GB with checkpointing, and document the
-    TBPTT hook for future K>15 runs).
   - set_per_process_memory_fraction guard to avoid OOM-killing Windows.
+
+v2 core fixes wired in here:
+  - Curriculum K: per-epoch K_min -> K_max schedule (cfg.resolve_K(epoch)).
+    Both train_step and eval_step use the epoch's K (K_epoch).
+  - Asynchronous probing decoder: trained in its own optimizer + backward
+    pass on a detached h_K, every cfg.decoder_interval JEPA steps. Zero
+    gradient entanglement with the JEPA loop.
 
 Logs scalars and a VRAM-budget table to Aim.
 """
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.amp import GradScaler, autocast
@@ -23,7 +27,7 @@ from .data.loader import build_dataloaders
 from .losses import total_loss
 from .models.rd_jepa import RDJEPA
 from .viz.aim_logger import AimLogger
-from .viz.decoder import VizDecoder
+from .viz.decoder import VizDecoder, make_decoder_optimizer
 
 
 def _collapse_diagnostics(z: torch.Tensor) -> dict[str, float]:
@@ -72,7 +76,7 @@ def _collapse_diagnostics(z: torch.Tensor) -> dict[str, float]:
         }
 
 
-def vram_budget_table(cfg: Config) -> str:
+def vram_budget_table(cfg: Config, k_epoch: int) -> str:
     """Print the VRAM budget so the user sees headroom before training starts."""
     if not torch.cuda.is_available():
         return "CUDA not available — running on CPU."
@@ -83,9 +87,10 @@ def vram_budget_table(cfg: Config) -> str:
         f"  total GPU memory   : {total:.2f} GB",
         f"  reserved fraction   : {cfg.vram_fraction} -> {reserved:.2f} GB cap",
         f"  batch size          : {cfg.batch_size}",
-        f"  K (deliberation)    : {cfg.K}",
+        f"  K_max (deliberation): {cfg.K_max}  (this epoch K={k_epoch})",
         f"  AMP dtype           : {cfg.amp_dtype}",
         f"  grad checkpoint     : {cfg.grad_checkpoint}",
+        f"  decoder interval    : every {cfg.decoder_interval} JEPA steps",
     ]
     return "\n".join(lines)
 
@@ -97,9 +102,13 @@ def train_step(
     batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     cfg: Config,
     step: int,
-    decoder: VizDecoder | None = None,
-    decoder_optimizer: torch.optim.Optimizer | None = None,
-) -> dict[str, float]:
+    k_epoch: int,
+) -> dict[str, Any]:
+    """One JEPA training step (no decoder — that runs asynchronously).
+
+    Args:
+        k_epoch: the curriculum-resolved K for this epoch.
+    """
     # v3 batch: (context[2*C,H,W], target[2*C,H,W], violation_gt[1])
     s_context, s_target, violation_gt = batch
     s_context = s_context.cuda(non_blocking=True)
@@ -111,7 +120,7 @@ def train_step(
     with autocast("cuda", dtype=amp_dtype):
         out = model(
             s_context,
-            K=cfg.K,
+            K=k_epoch,
             early_exit=False,  # train on full K for stable loss
             use_checkpoint=cfg.grad_checkpoint,
         )
@@ -124,42 +133,67 @@ def train_step(
             cfg,
             violation_gt=violation_gt,
         )
+    # Widen to dict[str, Any] so we can stash transient tensors for the
+    # asynchronous decoder step without violating the loss's float contract.
+    m: dict[str, Any] = {**metrics}
 
-    # Train viz decoder if provided (detached, fp32; doesn't affect JEPA).
-    # The decoder is an auxiliary visualization bolt-on, so we run it outside
-    # autocast to avoid the autocast/conv-transpose dtype edge case.
-    if decoder is not None and decoder_optimizer is not None:
-        # Use s_t (middle frame of context) as the RGB reconstruction target.
-        # context = stack(s_{t-1}, s_t), each [C,H,W] -> s_t is channels [C:2C].
-        C = cfg.img_channels
-        s_t = s_context[:, C : 2 * C, :, :]  # [B, C, H, W]
-        dec_loss = decoder.decoder_loss(out["h_K"].float(), s_t)
-        metrics["loss/viz_decoder"] = dec_loss.detach().float().item()
-        loss = loss + dec_loss  # Add to total loss for backward
-
+    # JEPA-only backward. The decoder is trained separately in
+    # train_decoder_step on a detached h_K with its own optimizer/backward.
     optimizer.zero_grad(set_to_none=True)
-    if decoder_optimizer is not None:
-        decoder_optimizer.zero_grad(set_to_none=True)
-
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    if decoder_optimizer is not None:
-        scaler.unscale_(decoder_optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    if decoder is not None:
-        torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
     scaler.step(optimizer)
-    if decoder_optimizer is not None:
-        scaler.step(decoder_optimizer)
     scaler.update()
 
     # EMA target update
     model.target_encoder.update_ema(model.encoder, step=step, warmup=cfg.ema_warmup)
 
-    metrics["train/k_used_mean"] = out["k_used"].float().mean().item()
+    m["train/k_used_mean"] = out["k_used"].float().mean().item()
+    m["train/K_epoch"] = float(k_epoch)
     if torch.cuda.is_available():
-        metrics["train/vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
-    return metrics
+        m["train/vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    # Expose h_K (detached, fp32) for the async decoder step (caller drains it).
+    m["_h_K_for_decoder"] = out["h_K"].detach().float()
+    m["_s_context_for_decoder"] = s_context.detach()
+    return m
+
+
+def train_decoder_step(
+    decoder: VizDecoder,
+    decoder_optimizer: torch.optim.Optimizer,
+    h_k: torch.Tensor,
+    s_context: torch.Tensor,
+    cfg: Config,
+) -> dict[str, float]:
+    """One asynchronous decoder training step on a detached h_K.
+
+    Runs in its own backward pass with its own optimizer — zero gradient
+    entanglement with the JEPA loop. The decoder learns to reconstruct s_t
+    (the middle frame of the context stack) from the frozen latent.
+    """
+    # s_t is the second frame of the context stack: channels [C:2C].
+    C = cfg.img_channels
+    s_t = s_context[:, C : 2 * C, :, :].float()  # [B, C, H, W]
+
+    # Decoder runs in fp32 (conv-transpose + autocast dtype edge case).
+    pred = decoder(h_k.detach())
+    loss = torch.nn.functional.mse_loss(pred, s_t)
+
+    decoder_optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    decoder_optimizer.step()
+
+    # PSNR for logging (higher = better reconstruction).
+    with torch.no_grad():
+        mse = loss.item()
+        psnr = float("inf") if mse <= 1e-12 else 10.0 * torch.log10(
+            torch.tensor(1.0) / torch.tensor(mse)
+        ).item()
+    return {
+        "decoder/loss": loss.detach().float().item(),
+        "decoder/psnr": psnr,
+    }
 
 
 @torch.no_grad()
@@ -167,7 +201,9 @@ def eval_step(
     model: RDJEPA,
     batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     cfg: Config,
+    k_epoch: int,
 ) -> dict[str, float]:
+    """One eval step. Uses the curriculum-resolved K (same as training)."""
     # v3 batch: (context[2*C,H,W], target[2*C,H,W], violation_gt[1])
     s_context, s_target, violation_gt = batch
     s_context = s_context.cuda(non_blocking=True)
@@ -178,7 +214,7 @@ def eval_step(
     with autocast("cuda", dtype=amp_dtype):
         out = model(
             s_context,
-            K=cfg.K,
+            K=k_epoch,
             early_exit=cfg.early_exit,
             tau=cfg.violation_tau,
             use_checkpoint=False,
@@ -195,6 +231,7 @@ def eval_step(
     # rename metrics to eval/ prefix
     metrics = {k.replace("loss/", "eval/loss/"): v for k, v in metrics.items()}
     metrics["eval/k_used_mean"] = out["k_used"].float().mean().item()
+    metrics["eval/K_epoch"] = float(k_epoch)
 
     # Collapse diagnostics on the final latent
     diag = _collapse_diagnostics(out["h_K"].detach())
@@ -225,7 +262,8 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
         logger = AimLogger(cfg)
     logger.init_run()
 
-    print(vram_budget_table(cfg))
+    k_epoch = cfg.resolve_K(0)
+    print(vram_budget_table(cfg, k_epoch))
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(cfg.vram_fraction, 0)
 
@@ -237,11 +275,12 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
     )
     scaler = GradScaler("cuda", enabled=(cfg.amp_dtype == "float16"))
 
-    # Viz decoder for visualization (optional but recommended)
+    # Asynchronous probing decoder: dedicated optimizer, trained in its own
+    # backward pass on a detached h_K every cfg.decoder_interval JEPA steps.
     decoder = VizDecoder(
         latent_dim=cfg.latent_total_dim, out_channels=cfg.img_channels
     ).cuda()
-    decoder_optimizer = torch.optim.AdamW(decoder.parameters(), lr=cfg.lr)
+    decoder_optimizer = make_decoder_optimizer(decoder, cfg)
 
     # Estimate total steps for LR scheduling
     steps_per_epoch = len(loaders["train"])
@@ -250,13 +289,27 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
 
     step = 0
     for epoch in range(cfg.epochs):
+        k_epoch = cfg.resolve_K(epoch)
         model.train()
         decoder.train()
         for batch in loaders["train"]:
             metrics = train_step(
-                model, optimizer, scaler, batch, cfg, step,
-                decoder=decoder, decoder_optimizer=decoder_optimizer
+                model, optimizer, scaler, batch, cfg, step, k_epoch=k_epoch
             )
+            # Asynchronous decoder step: own backward pass, own cadence.
+            if step % cfg.decoder_interval == 0:
+                dec_metrics = train_decoder_step(
+                    decoder,
+                    decoder_optimizer,
+                    metrics["_h_K_for_decoder"],
+                    metrics["_s_context_for_decoder"],
+                    cfg,
+                )
+                metrics.update(dec_metrics)
+            # Drop the transient tensors from metrics before logging.
+            metrics.pop("_h_K_for_decoder", None)
+            metrics.pop("_s_context_for_decoder", None)
+
             scheduler.step()
             metrics["train/lr"] = optimizer.param_groups[0]["lr"]
             logger.log_metrics(metrics, step=step, context={"subset": "train"})
@@ -265,16 +318,17 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
                     f"epoch {epoch} step {step} "
                     f"loss={metrics['loss/total']:.4f} "
                     f"lr={metrics['train/lr']:.2e} "
+                    f"K={metrics['train/K_epoch']:.0f} "
                     f"vram={metrics.get('train/vram_gb', 0):.2f}GB"
                 )
             step += 1
 
-        # eval
+        # eval (uses the same curriculum K_epoch as training)
         model.eval()
         eval_metrics: dict[str, float] = {}
         n = 0
         for batch in loaders["dev"]:
-            m = eval_step(model, batch, cfg)
+            m = eval_step(model, batch, cfg, k_epoch=k_epoch)
             for k, v in m.items():
                 eval_metrics[k] = eval_metrics.get(k, 0.0) + v
             n += 1
@@ -283,6 +337,7 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
         # Train and evaluate linear probe on the violation target
         try:
             from .eval.probe import evaluate_probe, train_violation_probe
+
             probe = train_violation_probe(
                 model, loaders["dev"], device=torch.device("cuda"), num_steps=50
             )
@@ -297,18 +352,20 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
         print(
             f"epoch {epoch} eval: "
             f"loss={eval_metrics.get('eval/loss/total', 0):.4f} "
+            f"K={eval_metrics.get('eval/K_epoch', 0):.0f} "
             f"k_used={eval_metrics.get('eval/k_used_mean', 0):.1f} "
             f"probe_r2={eval_metrics.get('eval/probe/r2', 0):.3f}"
         )
 
-        # checkpoint (model + decoder)
+        # checkpoint (model + decoder + decoder optimizer)
         ckpt = Path(cfg.exp_dir) / "ckpt.pt"
         ckpt.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "model": model.state_dict(),
             "decoder": decoder.state_dict(),
+            "decoder_optimizer": decoder_optimizer.state_dict(),
             "cfg": cfg.to_dict(),
-            "epoch": epoch
+            "epoch": epoch,
         }, ckpt)
 
     logger.close()

@@ -21,7 +21,7 @@ class ViolationProbe(nn.Module):
     against the collision-force target measures representation quality.
     """
 
-    def __init__(self, latent_dim: int = 256):
+    def __init__(self, latent_dim: int = 1024):
         super().__init__()
         self.fc = nn.Linear(latent_dim, 1)
 

@@ -1,11 +1,13 @@
-r"""Vision encoder $E_\theta$ mapping stacked RGB frames to a latent.
+r"""Vision encoder $E_\theta$ mapping stacked RGB frames to a spatial latent.
 
 A lightweight 4-layer strided CNN ending in a depthwise-conv block
-(ConvNeXt-flavored) for cheap spatial inductive bias, then a linear head
-to the configured latent dim. ~1.2M params, <2GB activations at batch 64.
+(ConvNeXt-flavored) for cheap spatial inductive bias, then a 1x1 conv head
+to `latent_channels`. ~1.2M params, <2GB activations at batch 64.
 
-Input is a stack of two RGB frames (s_{t-1}, s_t) for velocity context,
-giving `in_channels = 6` by default.
+Output is always spatial: [B, latent_channels, 4, 4] (the divergence-
+projection mask in the lens requires spatial axes). Input is a stack of
+two RGB frames (s_{t-1}, s_t) for velocity context, giving
+`in_channels = 6` by default.
 """
 from __future__ import annotations
 
@@ -41,23 +43,20 @@ class DepthwiseBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """E_\\theta: [B, in_channels, 64, 64] -> [B, latent_dim] (flat) or [B, C, 4, 4] (spatial).
+    r"""E_\theta: [B, in_channels, 64, 64] -> [B, latent_channels, 4, 4].
 
-    in_channels defaults to 6 (two stacked RGB frames). For a single-channel
-    input it can be set to 2 (two stacked grayscale frames).
+    Spatial latent only (v2). in_channels defaults to 6 (two stacked RGB
+    frames). The 4 stride-2 conv blocks reduce 64x64 -> 4x4; the 1x1 head
+    projects to `latent_channels`.
     """
 
     def __init__(
         self,
         in_channels: int = 6,
         channels: tuple[int, ...] = (32, 64, 128, 256),
-        latent_dim: int = 256,
-        spatial: bool = False,
         latent_channels: int = 64,
     ):
         super().__init__()
-        self.spatial = spatial
-        self.latent_dim = latent_dim
         self.latent_channels = latent_channels
 
         self.blocks = nn.ModuleList()
@@ -67,19 +66,11 @@ class Encoder(nn.Module):
             in_ch = ch
 
         self.depthwise = DepthwiseBlock(channels[-1])
-
-        if spatial:
-            # project to latent_channels, keep spatial dims (4x4 after 4 stride-2 convs)
-            self.head = nn.Conv2d(channels[-1], latent_channels, kernel_size=1)
-        else:
-            self.pool = nn.AdaptiveAvgPool2d(1)
-            self.head = nn.Linear(channels[-1], latent_dim)
+        # 1x1 conv head -> latent_channels, keeping the 4x4 spatial dims.
+        self.head = nn.Conv2d(channels[-1], latent_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x)
         x = self.depthwise(x)
-        if self.spatial:
-            return self.head(x)  # [B, C, 4, 4]
-        x = self.pool(x).flatten(1)  # [B, channels[-1]]
-        return self.head(x)  # [B, latent_dim]
+        return self.head(x)  # [B, latent_channels, 4, 4]
