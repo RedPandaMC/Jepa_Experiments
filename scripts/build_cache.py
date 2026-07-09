@@ -50,6 +50,7 @@ def build_cache(
     out_dir: Path = Path("data/cache"),
     seed: int = 42,
     fast: bool = False,
+    stride: int = 10,
 ) -> int:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -64,54 +65,77 @@ def build_cache(
     total_pairs = 0
     for split_name, task_ids in splits.items():
         print(f"[{split_name}] {len(task_ids)} tasks, {n_actions} actions/task")
-        sim = phyre.initialize_simulator(task_ids, "ball")
 
-        s_t_list = []
-        a_list = []
-        s_tp1_list = []
+        # Re-initialize the simulator per shard to bound memory (phyre leaks
+        # internal state per task; initializing all 1600 at once OOMs on 8GB).
+        shard_size = 200
 
-        for task_i in tqdm(range(len(task_ids)), desc=split_name):
-            for _ in range(n_actions):
-                action = action_mapper.sample()
-                res = sim.simulate_action(
-                    task_i, action, need_images=True, stride=1
-                )
-                if res.images is None:
-                    continue
+        s_t_list: list[np.ndarray] = []
+        a_list: list[np.ndarray] = []
+        s_tp1_list: list[np.ndarray] = []
 
-                imgs = res.images  # [T, 256, 256] uint8 scene-ids
-                if imgs.shape[0] < 2:
-                    continue
+        def flush_shard(shard_idx: int) -> int:
+            nonlocal s_t_list, a_list, s_tp1_list
+            if not s_t_list:
+                return 0
+            s_t = np.stack(s_t_list)
+            a = np.stack(a_list)
+            s_tp1 = np.stack(s_tp1_list)
+            out_path = out_dir / f"{tier}_fold{fold}_{split_name}_shard{shard_idx}.npz"
+            np.savez_compressed(
+                out_path,
+                s_t=s_t,
+                action=a,
+                s_tp1=s_tp1,
+                frame_size=frame_size,
+                version=CACHE_VERSION,
+            )
+            mb = out_path.stat().st_size / 1e6
+            print(f"  shard {shard_idx}: {s_t.shape[0]} pairs, {mb:.1f} MB -> {out_path.name}")
+            n = s_t.shape[0]
+            s_t_list, a_list, s_tp1_list = [], [], []
+            return n
 
-                # pick n_frames evenly-spaced frames; form consecutive pairs
-                idx = np.linspace(0, imgs.shape[0] - 1, n_frames).astype(int)
-                frames = imgs[idx]
-                frames_ds = downsample(frames, frame_size)  # [n_frames, H, W]
+        shard_idx = 0
+        for start in tqdm(range(0, len(task_ids), shard_size), desc=split_name):
+            end = min(start + shard_size, len(task_ids))
+            shard_ids = task_ids[start:end]
+            sim = phyre.initialize_simulator(shard_ids, "ball")
+            for local_i in range(len(shard_ids)):
+                for _ in range(n_actions):
+                    action = action_mapper.sample()
+                    try:
+                        res = sim.simulate_action(
+                            local_i, action, need_images=True, stride=stride
+                        )
+                    except Exception:
+                        continue
+                    if res.images is None:
+                        continue
 
-                for j in range(n_frames - 1):
-                    s_t_list.append(frames_ds[j])
-                    a_list.append(action.astype(np.float32))
-                    s_tp1_list.append(frames_ds[j + 1])
+                    imgs = res.images
+                    if imgs.shape[0] < 2:
+                        continue
 
-        s_t = np.stack(s_t_list)  # [N, H, W] uint8
-        a = np.stack(a_list)  # [N, 3] float32
-        s_tp1 = np.stack(s_tp1_list)
+                    idx = np.linspace(0, imgs.shape[0] - 1, n_frames).astype(int)
+                    frames = imgs[idx]
+                    frames_ds = downsample(frames, frame_size)
 
-        out_path = out_dir / f"{tier}_fold{fold}_{split_name}.npz"
-        np.savez_compressed(
-            out_path,
-            s_t=s_t,
-            action=a,
-            s_tp1=s_tp1,
-            task_ids=np.array(task_ids, dtype=object),
-            frame_size=frame_size,
-            version=CACHE_VERSION,
-        )
-        mb = out_path.stat().st_size / 1e6
-        print(f"  wrote {out_path}: {s_t.shape[0]} pairs, {mb:.1f} MB")
-        total_pairs += s_t.shape[0]
+                    for j in range(n_frames - 1):
+                        s_t_list.append(frames_ds[j])
+                        a_list.append(action.astype(np.float32))
+                        s_tp1_list.append(frames_ds[j + 1])
 
-    print(f"\nDone: {total_pairs} transitions cached.")
+            # flush after each shard and release the simulator
+            total_pairs += flush_shard(shard_idx)
+            shard_idx += 1
+            del sim
+
+        # write the task_ids manifest for this split
+        manifest_path = out_dir / f"{tier}_fold{fold}_{split_name}_manifest.txt"
+        manifest_path.write_text("\n".join(task_ids), encoding="utf-8")
+
+    print(f"\nDone: {total_pairs} transitions cached (sharded).")
     return 0
 
 
@@ -125,6 +149,7 @@ def main() -> int:
     p.add_argument("--out_dir", default="data/cache")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fast", action="store_true", help="50-task subset for ablations")
+    p.add_argument("--stride", type=int, default=10, help="frame subsample stride")
     args = p.parse_args()
 
     return build_cache(
@@ -136,6 +161,7 @@ def main() -> int:
         out_dir=Path(args.out_dir),
         seed=args.seed,
         fast=args.fast,
+        stride=args.stride,
     )
 
 
