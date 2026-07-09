@@ -12,14 +12,14 @@ build/
 # Aim
 .aim/
 
-# Runs / artifacts
+# Runs / artifacts (regenerated locally; keep the data cache)
 runs/
-data/cache/
-*.npz
 *.gif
 *.png
+!runs/smoke/*.png
 
-# PhyRE venv (external)
+# PhyRE venv (in-repo, gitignored — 400MB of binary wheels)
+.phyre39/
 phyre39/
 
 # IDE
