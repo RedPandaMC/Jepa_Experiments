@@ -94,41 +94,48 @@ def train_step(
     model: RDJEPA,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
-    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     cfg: Config,
     step: int,
     decoder: VizDecoder | None = None,
     decoder_optimizer: torch.optim.Optimizer | None = None,
 ) -> dict[str, float]:
-    # v2 batch: (context[2,H,W], action[3], target[2,H,W], solved[bool])
-    s_context, action, s_target, solved = batch
+    # v3 batch: (context[2*C,H,W], target[2*C,H,W], violation_gt[1])
+    s_context, s_target, violation_gt = batch
     s_context = s_context.cuda(non_blocking=True)
-    action = action.cuda(non_blocking=True)
     s_target = s_target.cuda(non_blocking=True)
-    solved = solved.cuda(non_blocking=True)
+    violation_gt = violation_gt.cuda(non_blocking=True)
 
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16
 
     with autocast("cuda", dtype=amp_dtype):
         out = model(
             s_context,
-            action,
             K=cfg.K,
             early_exit=False,  # train on full K for stable loss
             use_checkpoint=cfg.grad_checkpoint,
         )
         target = model.target(s_target)
         loss, metrics = total_loss(
-            out["all_h"], out["h_K"], target, out["violations"], cfg, solved=solved
+            out["all_h"],
+            out["h_K"],
+            target,
+            out["violations"],
+            cfg,
+            violation_gt=violation_gt,
         )
 
-        # Train viz decoder if provided (detached, doesn't affect JEPA)
-        if decoder is not None and decoder_optimizer is not None:
-            # Use first channel of context (s_t) as reconstruction target
-            s_t = s_context[:, 0:1, :, :]  # [B, 1, H, W]
-            dec_loss = decoder.decoder_loss(out["h_K"], s_t)
-            metrics["loss/viz_decoder"] = dec_loss.detach().float().item()
-            loss = loss + dec_loss  # Add to total loss for backward
+    # Train viz decoder if provided (detached, fp32; doesn't affect JEPA).
+    # The decoder is an auxiliary visualization bolt-on, so we run it outside
+    # autocast to avoid the autocast/conv-transpose dtype edge case.
+    if decoder is not None and decoder_optimizer is not None:
+        # Use s_t (middle frame of context) as the RGB reconstruction target.
+        # context = stack(s_{t-1}, s_t), each [C,H,W] -> s_t is channels [C:2C].
+        C = cfg.img_channels
+        s_t = s_context[:, C : 2 * C, :, :]  # [B, C, H, W]
+        dec_loss = decoder.decoder_loss(out["h_K"].float(), s_t)
+        metrics["loss/viz_decoder"] = dec_loss.detach().float().item()
+        loss = loss + dec_loss  # Add to total loss for backward
 
     optimizer.zero_grad(set_to_none=True)
     if decoder_optimizer is not None:
@@ -158,21 +165,19 @@ def train_step(
 @torch.no_grad()
 def eval_step(
     model: RDJEPA,
-    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     cfg: Config,
 ) -> dict[str, float]:
-    # v2 batch: (context[2,H,W], action[3], target[2,H,W], solved[bool])
-    s_context, action, s_target, solved = batch
+    # v3 batch: (context[2*C,H,W], target[2*C,H,W], violation_gt[1])
+    s_context, s_target, violation_gt = batch
     s_context = s_context.cuda(non_blocking=True)
-    action = action.cuda(non_blocking=True)
     s_target = s_target.cuda(non_blocking=True)
-    solved = solved.cuda(non_blocking=True)
+    violation_gt = violation_gt.cuda(non_blocking=True)
 
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16
     with autocast("cuda", dtype=amp_dtype):
         out = model(
             s_context,
-            action,
             K=cfg.K,
             early_exit=cfg.early_exit,
             tau=cfg.violation_tau,
@@ -180,7 +185,12 @@ def eval_step(
         )
         target = model.target(s_target)
         loss, metrics = total_loss(
-            out["all_h"], out["h_K"], target, out["violations"], cfg, solved=solved
+            out["all_h"],
+            out["h_K"],
+            target,
+            out["violations"],
+            cfg,
+            violation_gt=violation_gt,
         )
     # rename metrics to eval/ prefix
     metrics = {k.replace("loss/", "eval/loss/"): v for k, v in metrics.items()}
@@ -228,7 +238,9 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
     scaler = GradScaler("cuda", enabled=(cfg.amp_dtype == "float16"))
 
     # Viz decoder for visualization (optional but recommended)
-    decoder = VizDecoder(latent_dim=cfg.latent_total_dim).cuda()
+    decoder = VizDecoder(
+        latent_dim=cfg.latent_total_dim, out_channels=cfg.img_channels
+    ).cuda()
     decoder_optimizer = torch.optim.AdamW(decoder.parameters(), lr=cfg.lr)
 
     # Estimate total steps for LR scheduling
@@ -268,10 +280,10 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
             n += 1
         eval_metrics = {k: v / n for k, v in eval_metrics.items()}
 
-        # Train and evaluate linear probe on solved/unsolved
+        # Train and evaluate linear probe on the violation target
         try:
-            from .eval.probe import evaluate_probe, train_solved_probe
-            probe = train_solved_probe(
+            from .eval.probe import evaluate_probe, train_violation_probe
+            probe = train_violation_probe(
                 model, loaders["dev"], device=torch.device("cuda"), num_steps=50
             )
             probe_metrics = evaluate_probe(
@@ -286,7 +298,7 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
             f"epoch {epoch} eval: "
             f"loss={eval_metrics.get('eval/loss/total', 0):.4f} "
             f"k_used={eval_metrics.get('eval/k_used_mean', 0):.1f} "
-            f"probe_acc={eval_metrics.get('eval/probe/accuracy', 0):.3f}"
+            f"probe_r2={eval_metrics.get('eval/probe/r2', 0):.3f}"
         )
 
         # checkpoint (model + decoder)

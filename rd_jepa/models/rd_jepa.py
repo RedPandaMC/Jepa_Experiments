@@ -1,11 +1,12 @@
 r"""Top-level RD-JEPA model: encode -> K-step lens refinement -> early exit.
 
 Implements the Lens Paradigm (spec §2.2): a single shared refinement
-function $F_\\theta$ is applied K times to iteratively focus the latent
+function $F_\theta$ is applied K times to iteratively focus the latent
 until it is physically sharp. Weight sharing keeps VRAM flat in K.
 
-Cache v2 input: 2-channel stacked frames (s_{t-1}, s_t) for context and
-(s_t, s_{t+1}) for target, providing velocity information.
+Cache v3 input (MOVi): two stacked RGB frames (s_{t-1}, s_t) for context
+and (s_t, s_{t+1}) for target, providing velocity information. There is no
+action modality in MOVi, so the lens refines a purely visual latent.
 
 The loop returns:
   - h_K: the final (or early-exited) latent per sample.
@@ -20,7 +21,6 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import Config
-from .action_encoder import ActionEncoder
 from .deliberation import DeliberationStep, ViolationHead
 from .ema import EMATargetEncoder
 from .encoder import Encoder
@@ -33,9 +33,9 @@ class RDJEPA(nn.Module):
         spatial = cfg.latent_shape.value == "spatial"
         d = cfg.latent_total_dim
 
-        # v2: 2-channel input (frame stack for velocity)
+        # v3: stacked RGB frames (s_{t-1}, s_t) -> 2 * img_channels input
         self.encoder = Encoder(
-            in_channels=2,
+            in_channels=cfg.encoder_in_channels,
             channels=cfg.encoder_channels,
             latent_dim=cfg.latent_dim,
             spatial=spatial,
@@ -46,12 +46,8 @@ class RDJEPA(nn.Module):
         self.spatial = spatial
         self.flat_dim = d
 
-        self.action_encoder = ActionEncoder(
-            action_dim=cfg.action_dim, latent_dim=d, hidden_dim=d
-        )
         self.lens = DeliberationStep(
             latent_dim=d,
-            action_dim=d,
             hidden_dim=cfg.hidden_dim,
             gate=cfg.gate.value,
         )
@@ -74,28 +70,23 @@ class RDJEPA(nn.Module):
         return x
 
     def _refine_step(
-        self, h: torch.Tensor, a: torch.Tensor | None, use_checkpoint: bool
+        self, h: torch.Tensor, use_checkpoint: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One lens application; returns (h_next, violation_k)."""
 
-        def run(hh: torch.Tensor, aa: torch.Tensor | None) -> torch.Tensor:
-            return self.lens(hh, aa)
+        def run(hh: torch.Tensor) -> torch.Tensor:
+            return self.lens(hh)
 
         if use_checkpoint and h.requires_grad:
-            # checkpoint needs tensor args (None for a is fine via closure)
-            def fn(hh: torch.Tensor) -> torch.Tensor:
-                return run(hh, a)
-
-            h_next = checkpoint(fn, h, use_reentrant=False)
+            h_next = checkpoint(run, h, use_reentrant=False)
         else:
-            h_next = run(h, a)
+            h_next = run(h)
         v = self.violation(h_next)
         return h_next, v
 
     def forward(
         self,
         s_context: torch.Tensor,
-        action: torch.Tensor,
         K: int | None = None,
         early_exit: bool = False,
         tau: float = 0.1,
@@ -104,8 +95,8 @@ class RDJEPA(nn.Module):
         """Run the deliberation loop.
 
         Args:
-            s_context: [B, 2, H, W] stacked context frames (s_{t-1}, s_t).
-            action: [B, 3] raw action.
+            s_context: [B, C_in, H, W] stacked context frames (s_{t-1}, s_t).
+                C_in = 2 * img_channels (e.g. 6 for RGB).
             K: override cfg.K if set.
             early_exit: enable per-sample early exit on violation < tau.
             tau: violation threshold for early exit.
@@ -117,17 +108,14 @@ class RDJEPA(nn.Module):
 
         h = self._flatten(self.encoder(s_context))
         h = self.latent_norm(h)
-        a_enc = self.action_encoder(action)  # [B, d]
 
         all_h = []
         all_v = []
         k_used = torch.full((B,), K, device=device, dtype=torch.long)
         exited = torch.zeros(B, dtype=torch.bool, device=device)
 
-        inject_every = self.cfg.action_inject.value == "every"
         for k in range(K):
-            a_in = a_enc if (inject_every or k == 0) else None
-            h, v = self._refine_step(h, a_in, use_checkpoint)
+            h, v = self._refine_step(h, use_checkpoint)
             all_h.append(h)
             all_v.append(v)
 
@@ -158,7 +146,7 @@ class RDJEPA(nn.Module):
         """Stop-gradient target latent from the EMA encoder (for the loss).
 
         Args:
-            s_target: [B, 2, H, W] stacked target frames (s_t, s_{t+1}).
+            s_target: [B, C_in, H, W] stacked target frames (s_t, s_{t+1}).
         """
         with torch.no_grad():
             return self._flatten(self.target_encoder(s_target))

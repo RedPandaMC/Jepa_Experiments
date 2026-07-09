@@ -5,8 +5,8 @@ the latent focusing, so we attach a tiny auxiliary decoder trained
 jointly ONLY to visualize latents — it is detached from the JEPA loss
 and trained on a separate MSE to reproduce s_t from the encoder output.
 
-It decodes a flat latent [B, d] -> [B, 1, 64, 64] via 4 conv-transpose
-blocks. ~200K params, negligible VRAM.
+It decodes a flat latent [B, d] -> [B, 3, 64, 64] RGB frame via 4
+conv-transpose blocks. ~200K params, negligible VRAM.
 """
 from __future__ import annotations
 
@@ -17,8 +17,9 @@ from torch import nn
 class VizDecoder(nn.Module):
     """Tiny decoder for visualization only; not part of the JEPA loss."""
 
-    def __init__(self, latent_dim: int = 256):
+    def __init__(self, latent_dim: int = 256, out_channels: int = 3):
         super().__init__()
+        self.out_channels = out_channels
         # project latent -> [B, 256, 4, 4]
         self.proj = nn.Linear(latent_dim, 256 * 4 * 4)
         self.net = nn.Sequential(
@@ -28,12 +29,12 @@ class VizDecoder(nn.Module):
             nn.GELU(),
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # 32x32
             nn.GELU(),
-            nn.ConvTranspose2d(32, 1, 4, stride=2, padding=1),  # 64x64
+            nn.ConvTranspose2d(32, out_channels, 4, stride=2, padding=1),  # 64x64
             nn.Sigmoid(),
         )
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """[B, d] -> [B, 1, 64, 64] reconstructed frame in [0,1]."""
+        """[B, d] -> [B, C, 64, 64] reconstructed frame in [0,1]."""
         x = self.proj(h).view(-1, 256, 4, 4)
         return self.net(x)
 

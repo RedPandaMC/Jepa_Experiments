@@ -7,8 +7,10 @@ Implements spec §3.2:
      violation trajectories (encourages the lens to focus faster).
   3. VICReg-style variance + covariance regularization to prevent
      representation collapse (safety net beyond EMA/stop-grad).
+  4. Grounded violation supervision: regress V_psi toward MOVi's
+     collision-force ground truth in the lookahead window.
 
-Supports the Decision-3 ablation:
+Support the Decision-3 ablation:
   - 'final'     : loss only on h_K.
   - 'discounted': discounted loss over all intermediate h_k with gamma.
 """
@@ -93,26 +95,22 @@ def violation_supervision_loss(
 
 def violation_grounded_loss(
     violations: torch.Tensor,  # [K, B]
-    solved: torch.Tensor,  # [B] bool
+    violation_gt: torch.Tensor,  # [B] float in [0, 1]
 ) -> torch.Tensor:
-    """Grounded supervision: solved rollouts should have low violation.
+    """Grounded supervision: regress V_psi toward MOVi collision-force target.
 
-    Uses the PhyRE simulator's solved flag as a binary signal that the
-    physics is correct. A solved task should have near-zero violation;
-    unsolved may have high violation (or may just be non-solutions).
+    The target is the normalized sum of collision force magnitudes occurring in
+    the lookahead window (after s_t), derived from MOVi's per-frame collision
+    events during cache conversion. A scene with high collision energy should
+    report a high violation; a quiet scene should report near-zero violation.
 
-    This is a weak but real signal compared to the self-supervised latent
-    error used in violation_supervision_loss.
+    We supervise the *final-step* violation (h_K) since the lens has had the
+    full deliberation budget by then. Using smooth-L1 keeps the regression
+    robust to the heavy-tailed force distribution.
     """
-    if solved.dtype != torch.bool:
-        solved = solved.bool()
-    # For solved samples, violation should be low (target 0)
-    # For unsolved, we don't enforce (could be valid unsolved physics)
-    # So we only penalize high violation on solved samples
-    solved_mask = solved.unsqueeze(0)  # [1, B] broadcast to [K, B]
-    # MSE on solved samples only
-    loss = (violations * solved_mask.float()).pow(2).sum() / solved_mask.sum().clamp(min=1)
-    return loss
+    target = violation_gt.float().clamp(0.0, 1.0)
+    final_v = violations[-1]  # [B]
+    return torch.nn.functional.smooth_l1_loss(final_v, target)
 
 
 def vicreg_variance_loss(
@@ -149,7 +147,7 @@ def total_loss(
     target: torch.Tensor,
     violations: torch.Tensor,
     cfg: Config,
-    solved: torch.Tensor | None = None,
+    violation_gt: torch.Tensor | None = None,
     violation_weight: float = 0.01,
     violation_supervision_weight: float = 0.1,
     violation_grounded_weight: float = 0.1,
@@ -161,9 +159,9 @@ def total_loss(
     l_viol = violation_aux_loss(violations)
     l_viol_sup = violation_supervision_loss(violations, all_h, target)
 
-    # Grounded supervision using PhyRE solved flag (if provided)
-    if solved is not None and solved.any():
-        l_viol_ground = violation_grounded_loss(violations, solved)
+    # Grounded supervision using MOVi collision-force target (if provided)
+    if violation_gt is not None:
+        l_viol_ground = violation_grounded_loss(violations, violation_gt)
     else:
         l_viol_ground = torch.zeros((), device=violations.device, dtype=violations.dtype)
 

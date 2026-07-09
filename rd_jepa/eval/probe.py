@@ -1,38 +1,38 @@
-"""Linear probe training and evaluation."""
+"""Linear probe training and evaluation for the violation target."""
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn, optim
 
-from .probe_module import SolvedProbe
+from .probe_module import ViolationProbe
 
 
-def train_solved_probe(
+def train_violation_probe(
     model: nn.Module,
     dataloader,
     device: torch.device,
     num_steps: int = 100,
     lr: float = 1e-3,
-) -> SolvedProbe:
+) -> ViolationProbe:
     """Train a linear probe on top of frozen RD-JEPA latents.
 
-    The probe predicts solved/unsolved from h_K. This validates that
-    the learned representations encode task-relevant information.
+    The probe predicts the grounded collision-force violation_gt from h_K.
+    This validates that the learned representations encode collision-relevant
+    physical information.
 
     Args:
         model: Trained RD-JEPA (frozen, eval mode)
-        dataloader: DataLoader yielding (context, action, target, solved)
+        dataloader: DataLoader yielding (context, target, violation_gt)
         device: torch device
         num_steps: Number of optimization steps
         lr: Learning rate for probe
 
     Returns:
-        Trained SolvedProbe
+        Trained ViolationProbe
     """
     model.eval()
     d = model.flat_dim
-    probe = SolvedProbe(latent_dim=d).to(device)
+    probe = ViolationProbe(latent_dim=d).to(device)
     optimizer = optim.AdamW(probe.parameters(), lr=lr)
 
     step = 0
@@ -41,18 +41,16 @@ def train_solved_probe(
             if step >= num_steps:
                 break
 
-            s_context, action, s_target, solved = batch
+            s_context, _s_target, violation_gt = batch
             s_context = s_context.to(device)
-            action = action.to(device)
-            s_target = s_target.to(device)
-            solved = solved.to(device)
+            violation_gt = violation_gt.to(device)
 
             with torch.no_grad():
-                out = model(s_context, action)
+                out = model(s_context)
                 h_final = out["h_K"]
 
-            logits = probe(h_final)
-            loss = F.binary_cross_entropy_with_logits(logits, solved.float())
+            pred = probe(h_final)
+            loss = torch.nn.functional.mse_loss(pred, violation_gt.float())
 
             optimizer.zero_grad()
             loss.backward()
@@ -65,32 +63,31 @@ def train_solved_probe(
 
 def evaluate_probe(
     model: nn.Module,
-    probe: SolvedProbe,
+    probe: ViolationProbe,
     dataloader,
     device: torch.device,
 ) -> dict[str, float]:
     """Evaluate trained probe on a dataset.
 
     Returns:
-        Dict with accuracy, AUROC, solved fraction
+        Dict with MSE, R², mean violation target, mean prediction.
     """
     model.eval()
     probe.eval()
 
     all_h = []
-    all_solved = []
+    all_gt = []
 
     with torch.no_grad():
         for batch in dataloader:
-            s_context, action, s_target, solved = batch
+            s_context, _s_target, violation_gt = batch
             s_context = s_context.to(device)
-            action = action.to(device)
 
-            out = model(s_context, action)
+            out = model(s_context)
             all_h.append(out["h_K"])
-            all_solved.append(solved.to(device))
+            all_gt.append(violation_gt.to(device))
 
     h = torch.cat(all_h, dim=0)
-    solved = torch.cat(all_solved, dim=0)
+    violation_gt = torch.cat(all_gt, dim=0)
 
-    return probe.compute_metrics(h, solved)
+    return probe.compute_metrics(h, violation_gt)

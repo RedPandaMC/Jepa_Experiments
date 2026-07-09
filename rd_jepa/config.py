@@ -1,8 +1,11 @@
 """Central configuration for RD-JEPA.
 
 All hyperparameters live here so experiments can be swept by CLI overrides.
-The ablation knobs (gate, action injection, loss trajectory, latent shape)
-are first-class fields to keep the sweep script simple.
+The ablation knobs (gate, loss trajectory, latent shape) are first-class
+fields to keep the sweep script simple.
+
+Dataset: Kubric MOVi-A (pre-rendered physics videos, passive — no action
+modality). See scripts/convert_movi.py for cache generation.
 """
 from __future__ import annotations
 
@@ -15,11 +18,6 @@ from typing import Any
 class Gate(StrEnum):
     SIGMOID = "sigmoid"
     SPARSEMAX = "sparsemax"
-
-
-class ActionInject(StrEnum):
-    ONCE = "once"
-    EVERY = "every"
 
 
 class LossTrajectory(StrEnum):
@@ -35,9 +33,11 @@ class LatentShape(StrEnum):
 @dataclass
 class Config:
     # --- data ---
-    tier: str = "ball_cross_template"
-    fold: int = 0
-    frame_size: int = 64
+    movi_variant: str = "movi_a"  # one of movi_a/b/c/d/e
+    movi_resolution: int = 128  # source resolution to download (128 or 256)
+    split: str = "train"  # tfds split name (train/validation/test)
+    frame_size: int = 64  # frames are downsampled to this during conversion
+    img_channels: int = 3  # RGB (MOVi is RGB, not PhyRE scene-id maps)
     cache_dir: Path = Path("data/cache")
     runs_dir: Path = Path("runs")
     seed: int = 42
@@ -45,11 +45,10 @@ class Config:
     # --- model ---
     latent_dim: int = 256
     latent_channels: int = 64  # only used when latent_shape == spatial -> [B, C, 4, 4]
-    action_dim: int = 3  # (x, y, r) in [0,1]
+    # encoder in_channels = img_channels * 2 (two stacked frames for velocity)
     hidden_dim: int = 512
     encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
     gate: Gate = Gate.SIGMOID
-    action_inject: ActionInject = ActionInject.EVERY
     latent_shape: LatentShape = LatentShape.FLAT
 
     # --- deliberation loop ---
@@ -57,6 +56,10 @@ class Config:
     early_exit: bool = True
     violation_tau: float = 0.1  # early-exit threshold on V_psi
     latent_layernorm: bool = True  # LayerNorm on encoder output before deliberation
+
+    # --- violation grounding (collision-force regression target) ---
+    violation_lookahead: int = 3  # frames ahead (after s_t) to sum collision force
+    violation_force_scale: float = 50000.0  # MOVi collision forces are ~1e4-1e5
 
     # --- training ---
     batch_size: int = 32
@@ -88,7 +91,6 @@ class Config:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["gate"] = self.gate.value
-        d["action_inject"] = self.action_inject.value
         d["loss_trajectory"] = self.loss_trajectory.value
         d["latent_shape"] = self.latent_shape.value
         d["cache_dir"] = str(self.cache_dir)
@@ -105,3 +107,8 @@ class Config:
         if self.latent_shape is LatentShape.SPATIAL:
             return self.latent_channels * 4 * 4
         return self.latent_dim
+
+    @property
+    def encoder_in_channels(self) -> int:
+        """Number of input channels to the encoder (2 stacked RGB frames)."""
+        return self.img_channels * 2

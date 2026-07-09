@@ -1,8 +1,11 @@
-r"""Vision encoder $E_\theta$ mapping a 64x64 scene-id frame to a latent.
+r"""Vision encoder $E_\theta$ mapping stacked RGB frames to a latent.
 
 A lightweight 4-layer strided CNN ending in a depthwise-conv block
 (ConvNeXt-flavored) for cheap spatial inductive bias, then a linear head
 to the configured latent dim. ~1.2M params, <2GB activations at batch 64.
+
+Input is a stack of two RGB frames (s_{t-1}, s_t) for velocity context,
+giving `in_channels = 6` by default.
 """
 from __future__ import annotations
 
@@ -38,11 +41,15 @@ class DepthwiseBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """E_\\theta: [B, in_channels, 64, 64] -> [B, latent_dim] (flat) or [B, C, 4, 4] (spatial)."""
+    """E_\\theta: [B, in_channels, 64, 64] -> [B, latent_dim] (flat) or [B, C, 4, 4] (spatial).
+
+    in_channels defaults to 6 (two stacked RGB frames). For a single-channel
+    input it can be set to 2 (two stacked grayscale frames).
+    """
 
     def __init__(
         self,
-        in_channels: int = 2,
+        in_channels: int = 6,
         channels: tuple[int, ...] = (32, 64, 128, 256),
         latent_dim: int = 256,
         spatial: bool = False,
