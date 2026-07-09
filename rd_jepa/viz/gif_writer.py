@@ -33,7 +33,7 @@ def _to_pil(frame_tensor: torch.Tensor, size: int = 256) -> Image.Image:
     rgb = (frame.transpose(1, 2, 0) * 255).astype(np.uint8)  # [H, W, 3]
     img = Image.fromarray(rgb)
     if size != img.size[0]:
-        img = img.resize((size, size), Image.BILINEAR)
+        img = img.resize((size, size), Image.Resampling.BILINEAR)
     return img
 
 

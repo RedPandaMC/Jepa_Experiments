@@ -34,17 +34,15 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import sys
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
-from PIL import Image
-from tqdm import tqdm
-
 import tfrecord
+from PIL import Image
 from tfrecord import example_pb2
+from tqdm import tqdm
 
 BUCKET = "kubric-public"
 GCS_LIST = f"https://storage.googleapis.com/storage/v1/b/{BUCKET}/o"
@@ -91,7 +89,7 @@ def list_shards(variant: str, resolution: int, tfds_split: str) -> list[str]:
         page_token = data.get("nextPageToken")
         if not page_token:
             break
-    want = f".tfrecord-"
+    want = ".tfrecord-"
     return [n for n in names if want in n and f"-{tfds_split}." in n]
 
 
