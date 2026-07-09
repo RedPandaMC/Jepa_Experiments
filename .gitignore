@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# uv
+.uv-cache/
+
+# Aim
+.aim/
+
+# Runs / artifacts
+runs/
+data/cache/
+*.npz
+*.gif
+*.png
+
+# PhyRE venv (external)
+phyre39/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
