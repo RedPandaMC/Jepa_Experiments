@@ -20,9 +20,8 @@ runs/
 *.gif
 !runs/smoke/*.png
 
-# PhyRE venv (in-repo, gitignored — 400MB of binary wheels)
-.phyre39/
-phyre39/
+# MOVi raw tfrecord shards downloaded by scripts/convert_movi.py
+data/cache/_raw/
 
 # LaTeX build artifacts (keep sources + rendered pdf/png/svg)
 docs/*.aux
