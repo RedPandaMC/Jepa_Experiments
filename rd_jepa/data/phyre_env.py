@@ -14,19 +14,28 @@ project. We default to ``/tmp/phyre39`` but allow overriding via the
 import os
 from pathlib import Path
 
-DEFAULT_PHYRE_VENV = Path(os.environ.get("PHYRE_VENV", "/tmp/phyre39"))
+DEFAULT_PHYRE_VENV = Path(os.environ.get("PHYRE_VENV", ".phyre39"))
 
 
 def phyre_venv_python() -> Path:
-    """Return the python executable for the phyre 3.9 venv, or error helpfully."""
-    py = DEFAULT_PHYRE_VENV / "bin" / "python"
+    """Return the python executable for the phyre 3.9 venv, or error helpfully.
+
+    The venv lives in-repo at ``.phyre39/`` (gitignored) so it survives
+    reboots. Recreate it with ``scripts/setup_phyre_venv.sh`` if missing,
+    or set PHYRE_VENV to point at an existing 3.9+phyre venv.
+    """
+    # resolve relative to the repo root (parent of rd_jepa/)
+    if not DEFAULT_PHYRE_VENV.is_absolute():
+        repo_root = Path(__file__).resolve().parents[2]
+        venv_dir = repo_root / DEFAULT_PHYRE_VENV
+    else:
+        venv_dir = DEFAULT_PHYRE_VENV
+    py = venv_dir / "bin" / "python"
     if not py.exists():
         raise SystemExit(
             f"PhyRE venv not found at {py}.\n"
-            f"Create it once with:\n"
-            f"  uv venv --python 3.9 {DEFAULT_PHYRE_VENV}\n"
-            f"  uv pip install --python {DEFAULT_PHYRE_VENV}/bin/python "
-            f"phyre numpy imageio pillow\n"
+            f"Recreate it with:\n"
+            f"  bash scripts/setup_phyre_venv.sh\n"
             f"Or set PHYRE_VENV to point at an existing 3.9+phyre venv."
         )
     return py
