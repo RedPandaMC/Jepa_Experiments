@@ -1,68 +1,78 @@
 # RD-JEPA
 
-Recurrent Deliberation JEPA — a latent-space world model that uses test-time
-compute to iteratively refine physical predictions. POC targeting PhyRE on a
-single RTX 3070 laptop (8GB VRAM).
+Recurrent Deliberation JEPA — a latent-space physics world model that uses
+test-time compute to iteratively refine physical predictions. POC targeting
+the Kubric MOVi-A dataset on a single RTX 3070 laptop (8GB VRAM).
 
-## What's New (v2)
+## What's New (v3)
 
-- **Two-frame input**: Model now sees velocity via stacked frames `(s_{t-1}, s_t)`, fixing the non-Markovian prediction target
-- **Grounded supervision**: Violation head trained on PhyRE's `solved` flag, not just latent error
-- **Collapse prevention**: VICReg variance/covariance regularization + diagnostics (effective rank, cosine similarity)
-- **Linear probe eval**: Downstream `solved/unsolved` classification validates representation quality
-- **AUCCESS metric**: Action ranking evaluation for physical reasoning benchmark
-- **LR scheduling**: Warmup + cosine decay
-- **LayerNorm**: On encoder output for training stability
-- **Trained viz decoder**: Gifs now show actual reconstructions, not random noise
+- **New dataset: Kubric MOVi-A**. Pre-rendered physics videos (rigid-body
+  collisions of CLEVR-style shapes) downloaded from `gs://kubric-public/tfds`.
+  This **removes the dual-Python-version problem**: the entire pipeline
+  (download, convert, train) now runs in a single Python 3.11 env. No more
+  `.phyre39/` venv, no ABI-locked C++ simulator bindings.
+- **Pure-Python data ingestion**: MOVi's tfds shards are plain
+  `tf.Example`/`.tfrecord` records parsed with the `tfrecord` PyPI package +
+  Pillow. **No TensorFlow dependency anywhere.**
+- **RGB input**: encoder now consumes stacked RGB frames `(s_{t-1}, s_t)` →
+  `in_channels = 6` (was 2 for PhyRE scene-id maps).
+- **Action modality removed**: MOVi is passive video (no ball-drop action),
+  so the Action Encoder and action-injection ablation have been removed. The
+  Lens now refines a purely visual latent.
+- **Grounded violation supervision via collisions**: the Violation Head is now
+  trained (regression, smooth-L1) against a target derived from MOVi's
+  per-frame `events.collisions.force` — a genuine physics quantity instead of
+  PhyRE's binary `solved` flag.
+- **Linear probe** repurposed to predict the collision-force violation target
+  (MSE/R²) instead of solved/unsolved classification. The PhyRE-only AUCCESS
+  ranking metric has been removed.
 
 ## Quick start
 
 ```bash
-# Setup (both envs managed by uv)
-uv sync                              # main training env (Python 3.11)
-bash scripts/setup_phyre_venv.sh     # PhyRE data env (Python 3.9)
-.phyre39/bin/python scripts/smoke.py # verify PhyRE works
+# Single env for everything (Python 3.11 + torch + tfrecord)
+uv sync
 
-# Build data cache (if needed)
-rm -f data/cache/*.npz
-for i in {0..3}; do
-  .phyre39/bin/python scripts/build_cache.py --tier ball_cross_template --fold 0 \
-    --worker-id $i --n-workers 4 &
-done
-wait
+# Smoke test the data pipeline: download 1 MOVi-A shard, parse 5 videos,
+# emit a tiny npz shard. (Validates parsing without a full download.)
+uv run python scripts/convert_movi.py --smoke
 
-# Train
-uv run python scripts/train_rdjepa.py --K 15
+# (Optional) estimate a good --force-scale before the full run:
+uv run python scripts/convert_movi.py --scan-scale --max-shards 20
 
-# Evaluate
-uv run python scripts/eval_cross_fold.py --exp default --folds 0 1 2
+# Build the train cache (downsamples to 64x64). --max-shards N / --max-videos M
+# to bound work on an 8GB laptop for a first pass.
+uv run python scripts/convert_movi.py --split train --out-split train --force-scale 1.0
 
-# Visualize
-uv run python scripts/render_rollout.py --exp default
+# Build the dev cache from MOVi's validation split.
+uv run python scripts/convert_movi.py --tfds-split validation --out-split dev
+
+# Train (library entry point)
+uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import train; train(Config(exp_name='default'))"
+
+# Metrics dashboard
 uv run aim up
 ```
 
 ## Unified uv Workflow
 
-Both environments are managed by uv:
-- **Main env** (`uv sync`): Python 3.11, PyTorch, training code
-- **PhyRE env** (`.phyre39/`): Python 3.9, PhyRE simulator, data generation
+One environment, one Python version, one ML framework (PyTorch):
+
+- **Main env** (`uv sync`): Python 3.11, PyTorch, `tfrecord`, Pillow. Used for
+  data conversion AND training. No second venv, no TensorFlow.
 
 ```bash
-# Install Python 3.9 for PhyRE env
-uv python install 3.9
-
-# Recreate PhyRE env
-bash scripts/setup_phyre_venv.sh
+uv sync
 ```
 
 ## Layout
 
 ```
 rd_jepa/         library (config, data, models, losses, viz, eval)
-scripts/         entry points (train, render, ablations, eval, cache)
+scripts/         convert_movi.py (data cache builder)
 tests/           pytest suite + collapse regression tests
-data/cache/      PhyRE transition cache (v2 format with s_tm1, solved)
+data/cache/      MOVi transition cache (v3 format: RGB + violation_gt)
+data/cache/_raw/ transient raw tfrecord shards (gitignored)
 docs/            architecture diagrams
 ```
 
@@ -75,15 +85,13 @@ uv run ruff check . --fix    # auto-fix
 uv run pytest                # tests
 uv run mypy rd_jepa/         # type check
 
-# Training
-uv run python scripts/train_rdjepa.py --K 15 --epochs 20
-uv run python scripts/run_ablations.py --mode oat
+# Data
+uv run python scripts/convert_movi.py --smoke
+uv run python scripts/convert_movi.py --scan-scale --max-shards 20
+uv run python scripts/convert_movi.py --split train --out-split train
+uv run python scripts/convert_movi.py --tfds-split validation --out-split dev
 
-# Evaluation
-uv run python scripts/eval_cross_fold.py --exp default --folds 0 1 2
-
-# Visualization
-uv run python scripts/render_rollout.py --exp default
+# Training / Viz
 uv run aim up                # metrics dashboard
 ```
 
@@ -92,6 +100,7 @@ uv run aim up                # metrics dashboard
 - **Lens Paradigm**: Shared refinement function applied K times, constant VRAM
 - **Early exit**: Dynamic deliberation depth via violation threshold
 - **JEPA training**: Latent prediction with EMA target encoder, no pixel decode
-- **Two-channel input**: Velocity-aware via frame stacking
+- **Two-frame input**: Velocity-aware via frame stacking (now RGB)
+- **Physics-grounded violation**: collision-force regression target
 
 See `rd-jepa-technical-specification.md` for full details.
