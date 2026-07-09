@@ -43,31 +43,29 @@
 % ===================== TOP-LEVEL PIPELINE (single horizontal chain) =======
 % Everything below is positioned RELATIVE to its neighbour — no raw coordinates.
 
-\node[font=\sffamily\footnotesize, text=enc!35!black, below=14mm of title, xshift=-32mm] (stp) {$s_t$ (64$\times$64)};
+\node[font=\sffamily\footnotesize, text=enc!35!black, below=18mm of title, xshift=-32mm] (stp) {$s_t$ (64$\times$64)};
 \node[enc, below=of stp] (encb) {Context Encoder $E_\theta$\\[-1pt]\scriptsize 4$\times$ConvBlock(s=2)+ConvNeXt};
 \node[latent, minimum width=20mm, below=of encb] (h0) {$h_0\in\mathbb{R}^{256}$};
 
-\node[lensblock, right=28mm of encb, yshift=-8mm] (lens)
+\node[lensblock, right=30mm of h0] (lens)
   {\bfseries Deliberation Loop\\[1pt] the Lens $F_\theta$\\[3pt]
    \footnotesize $h_k = h_{k\text{-}1}+\tanh(M_k\odot\mathrm{MLP}_{\mathrm{add}}(h_{k\text{-}1},a_t))$\\[1pt]
    \footnotesize shared weights $\cdot$ constant VRAM in $K$};
 
 \node[latent, minimum width=20mm, right=28mm of lens] (hK) {$h_K$ (or early-exit $h_k$)};
-\node[decision, above=of hK, yshift=6mm] (exit) {$v_k<\tau$?};
+\node[decision, above=16mm of hK] (exit) {$v_k<\tau$?};
 \node[latent, minimum width=22mm, right=22mm of hK] (hfinal) {$h_{\mathrm{final}}$};
 
-% self-loop icon on the lens block: a short curled arrow, entirely local to the block
-\draw[->, draw=lens!70!black, line width=1.1pt]
-  (lens.north east) to[out=60,in=120,looseness=10] node[above, font=\sffamily\bfseries\scriptsize, text=lens!45!black, yshift=1mm] {$\times K$} (lens.north);
-
-% main chain arrows
+% main chain arrows (h0 and lens share the same y, so this is a clean horizontal line)
 \draw[arr] (stp) -- (encb);
 \draw[arr] (encb) -- (h0);
 \draw[arr] (h0) -- (lens);
 \draw[arr] (lens) -- (hK);
 \draw[arr] (hK.north) -- (exit.south) node[lab, midway, right] {$v_k$};
 \draw[arr] (exit.east) -- ++(1.0,0) |- (hfinal.north) node[lab, pos=0.3, above] {yes};
-\draw[arr, draw=lens!70!black] (exit.west) -- ++(-1.0,0) |- (lens.north) node[lab, pos=0.75, above, text=lens!45!black] {no, repeat};
+% "no, repeat" loop-back: arcs cleanly ABOVE the whole chain, well clear of the title
+\draw[arr, draw=lens!70!black, line width=1.1pt] (exit.north) -- ++(0,10mm) -| (lens.north)
+  node[lab, pos=0.62, above, text=lens!45!black] {no, repeat $\times K$ (shared weights)};
 
 % ===================== ACTION PIPELINE (feeds up into the lens) ===========
 \node[act, minimum width=26mm, below=20mm of h0, xshift=6mm] (aenc) {Action Encoder $A_\varphi$\\[-1pt]\scriptsize Linear$\to$GELU$\to$Linear ($3\!\to\!256$)};
@@ -75,8 +73,8 @@
 \node[latent, minimum width=18mm, above=of aenc] (aencout) {$a_{\mathrm{enc}}\in\mathbb{R}^{256}$};
 \draw[arr] (ain) -- (aenc);
 \draw[arr] (aenc) -- (aencout);
-\draw[arr, draw=act!70] (aencout.north) -- (aencout.north |- lens.south) -- (lens.south)
-  node[lab, midway, right, text=act!50!black] {$a_{\mathrm{enc}}$, every $k$};
+\draw[arr, draw=act!70] (aencout.east) -- (lens.west |- aencout.east)
+  node[lab, midway, above, text=act!50!black] {$a_{\mathrm{enc}}$, every $k$};
 
 % ===================== EMA TARGET (side branch feeding the Loss) ==========
 \node[font=\sffamily\footnotesize, text=target!45!black, above=14mm of hfinal, xshift=22mm] (stp1) {$s_{t+1}$ (64$\times$64)};
@@ -100,7 +98,7 @@
 % ===================== DETAIL INSET: one refinement step (self-contained) ==
 \node[font=\sffamily\bfseries, text=lens!35!black, below=32mm of ain, xshift=6mm] (insettitle) {Inside the Lens — one refinement step $F_\theta(h_{k\text{-}1},a_t)\to h_k$};
 
-\node[latent, below=10mm of insettitle, xshift=-70mm] (i_hin) {$h_{k\text{-}1}$};
+\node[latent, below=26mm of insettitle, xshift=-70mm] (i_hin) {$h_{k\text{-}1}$};
 \node[op, right=of i_hin] (i_cat) {$\|$};
 \node[smallnode, draw=add!70!black, fill=add!10, right=of i_cat, minimum width=22mm] (i_add) {$\mathrm{MLP}_{\mathrm{add}}$};
 \node[latent, right=of i_add] (i_hadd) {$h^{\mathrm{add}}_k$};
@@ -124,7 +122,7 @@
 % mask branch: short local arc ABOVE the row
 \node[smallnode, draw=sub!70!black, fill=sub!10, above=9mm of i_hadd, minimum width=24mm] (i_mask) {$\mathrm{MLP}_{\mathrm{mask}}\!\to\!\mathrm{Gate}$};
 \draw[arr] (i_hadd.north) -- (i_mask.south);
-\draw[arr] (i_mask.west) -- ++(0,0) -| (i_had.north) node[lab, pos=0.5, above] {$M_k$};
+\draw[arr] (i_mask.west) -| (i_had.north) node[lab, pos=0.5, above] {$M_k$};
 
 % action injection: short local arc BELOW cat
 \node[latent, below=9mm of i_cat, minimum width=16mm] (i_a) {$a_{\mathrm{enc}}$};
