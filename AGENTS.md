@@ -66,13 +66,26 @@ uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import t
   `solved` bool
 - **GPU**: Targets RTX 3070 8GB via AMP + gradient checkpointing
 - **VICReg**: Variance/covariance regularization prevents representation collapse
-- **v2 architecture (three core fixes, all on by default)**:
-  - **Spatial latent + Navier-Stokes masking**: the latent is always
-    `[B, 64, 4, 4]` (flat 1024 for the MLPs). The lens subtractive phase is a
-    `DivergenceProjection` (Sobel divergence + learned per-sample projection
-    scalar + L2 mass renormalization) — the CFD incompressibility projection,
-    redistributing density rather than zeroing overlap. No Sigmoid/Sparsemax
-    gate, no FLAT latent path.
+- **v3 architecture (mutating kernel lens)**:
+  - **Spatial latent + kernel lens**: the latent is always
+    `[B, 64, 4, 4]` (flat 1024 externally). The lens is a `KernelLens` — a
+    bank of N=4 depthwise conv kernels `[N, C, 3, 3]` that operate on the
+    spatial latent via `unfold` + `einsum` (per-sample depthwise conv with
+    per-sample kernels). No MLP-based lenses, no `DivergenceProjection`.
+  - **Mutating kernels (test-time compute)**: the kernel state
+    `[B, N, C, kH, kW]` is initialized from learned base kernels (seeded
+    with Sobel-x, Sobel-y, Laplacian, identity priors) and **evolves
+    per-sample** during the K deliberation steps. A mutator network reads the
+    pooled latent and produces per-sample kernel deltas at each step — the
+    kernels literally transform based on what the latent looks like. This
+    makes test-time compute meaningful: different inputs lead to different
+    kernel trajectories. The `step_scale` and `mutation_scale` are
+    learnable parameters bounded by `tanh`.
+  - **Attention gate**: a lightweight gate (LayerNorm + MLP → softmax over N
+    kernels) selects which kernels to activate at each step. No MoE router,
+    no load-balance loss, no router-entropy loss. A `kernel_diversity_loss`
+    (pairwise cosine similarity between base kernels, weight 0.01) prevents
+    all kernels from collapsing to identical filters.
   - **Anti-collapse losses**: Latent Energy Conservation
     (`|‖h_K‖−‖h_0‖|²`), Contrastive Dynamics (margin loss penalizing stasis
     when `violation_gt > 0`), Divergence Regularization (per-step latent-mass
@@ -84,29 +97,21 @@ uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import t
     optimizer + backward pass on a **detached** `h_K`, every
     `cfg.decoder_interval` (default 4) JEPA steps — zero gradient
     entanglement with the thinking loop.
-  - **MoE Lens Bank**: `RDJEPA.lens` is a `LensBank` of N=4 specialist
-    `DeliberationStep`s + a soft-routing router (MLP → softmax gate
-    `[B,N]` per step). Each lens keeps its own `mlp_add` +
-    `DivergenceProjection` (per-lens `mlp_alpha`); the fixed Sobel kernels
-    are identical across lenses. The bank mixes the N lens deltas by the
-    gate, mass-renormalizes to `‖mean_i delta_i‖`, and applies `tanh`.
-    `load_balance_loss` (MoE uniform-usage, weight 0.01) +
-    `router_entropy_loss` (entropy bonus, weight 0.005) prevent
-    degenerate routing. `n_lenses=1` disables routing (single-lens path,
-    `gate=None`, no router in the graph).
-- **Action modality removed**: MOVi is passive video; the Lens Bank refines a
+- **Action modality removed**: MOVi is passive video; the kernel lens refines a
   purely visual latent
 
-## v2 breaking changes (from v1)
+## v3 breaking changes (from v2)
 
-- `Config(K=15, ...)` no longer works — use `K_max=15`. The removed ablation
-  fields (`gate`, `latent_shape`, `loss_trajectory`, `gamma`, `tbptt_n`, `K`)
-  are rejected; the single unified architecture has no toggleable paths.
-- Old `runs/*/ckpt.pt` files (single `lens.*` keys) **will not load** into
-  the lens-bank model — `RDJEPA.lens` is now a `LensBank` whose state-dict
-  keys are `lens.lenses.{i}.*` + `lens.router.*`. Start fresh from a new run.
-  (`n_lenses=1` gives the same single-lens behavior but still has the
-  `lens.lenses.0.` prefix, so it's a key-path change even at N=1.)
+- `Config(n_lenses=4, ...)` no longer works — use `n_kernels=4`. The removed
+  v2 fields (`n_lenses`, `load_balance_weight`, `router_entropy_weight`) are
+  rejected. New fields: `n_kernels`, `kernel_size`, `kernel_diversity_weight`.
+- Old `runs/*/ckpt.pt` files (MoE `LensBank` with `lens.lenses.{i}.*` +
+  `lens.router.*` keys) **will not load** — `RDJEPA.lens` is now a
+  `KernelLens` whose state-dict keys are `lens.base_kernels`,
+  `lens.gate.*`, `lens.mutator.*`. Start fresh from a new run.
+- `batch_size` reduced from 256 to 128; `grad_checkpoint` now defaults to
+  `True` (laptop-friendly). `hidden_dim` reduced from 256 to 128.
+- `latent_dim` fixed to 1024 (was incorrectly 512 in v2 despite the comment).
 - `VizDecoder.decoder_loss` no longer detaches internally — the caller
   (`train_decoder_step`) detaches `h_K` explicitly. Direct callers of
   `decoder_loss` must pass `h.detach()`.
