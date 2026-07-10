@@ -31,19 +31,11 @@ from .viz.decoder import VizDecoder, make_decoder_optimizer
 from .viz.gif_writer import render_rollout_for_eval
 
 
-def _should_render_gifs(epoch: int, total_epochs: int) -> bool:
-    """Dense-early / sparse-late gif-rendering schedule, scaled by total epochs.
-
-    Renders every epoch for the first ~10% of training (the curriculum ramp
-    + fastest loss descent), then thins to roughly every 5% of total epochs.
-    This keeps the gif count proportional to the run length: a 100-epoch run
-    produces ~28 gif-pairs, a 20-epoch run produces ~9.
-    """
-    ramp = max(5, total_epochs // 10)
-    if epoch < ramp:
-        return True
-    interval = max(1, total_epochs // 20)
-    return (epoch - ramp) % interval == 0
+def _should_render_gifs(epoch: int, total_epochs: int, every_n_epochs: int = 5) -> bool:
+    """Render gifs only on a sparse cadence to keep training overhead low."""
+    if every_n_epochs <= 0:
+        return False
+    return epoch % every_n_epochs == 0 or epoch == total_epochs - 1
 
 
 def _should_eval(epoch: int, total_epochs: int) -> bool:
@@ -418,7 +410,7 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
         # Render + log deliberation/rollout gifs to Aim. Dense early (every
         # epoch through the curriculum ramp), sparse once training plateaus.
         # Cadence scales with total epochs (see _should_render_gifs).
-        if _should_render_gifs(epoch, cfg.epochs):
+        if _should_render_gifs(epoch, cfg.epochs, every_n_epochs=cfg.viz_every_n_epochs):
             try:
                 # Pull one dev batch for visualization. Reuse the first batch
                 # by re-iterating; eval was in the same model.eval() context.

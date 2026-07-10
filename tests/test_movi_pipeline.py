@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 
 import numpy as np
+import pytest
 import torch
 
 from rd_jepa.config import Config
@@ -27,6 +28,7 @@ from rd_jepa.losses import (
 from rd_jepa.models.deliberation import DivergenceProjection, LensBank
 from rd_jepa.models.rd_jepa import RDJEPA
 from rd_jepa.viz.decoder import VizDecoder, make_decoder_optimizer
+from rd_jepa.viz.gif_writer import _select_viz_indices
 
 
 def _write_synthetic_shard(path, n: int = 12) -> None:
@@ -62,7 +64,7 @@ def test_config_v2_defaults():
     # decoder async config
     assert cfg.decoder_interval == 4
     # higher-throughput VRAM defaults
-    assert cfg.batch_size >= 64
+    assert cfg.batch_size >= 256
     assert cfg.grad_checkpoint is False
     assert cfg.vram_fraction >= 0.95
     # lens bank
@@ -205,6 +207,19 @@ def test_decoder_optimizer_is_dedicated():
     dec_params = {id(p) for p in opt.param_groups[0]["params"]}
     model_params = {id(p) for p in model.parameters()}
     assert dec_params.isdisjoint(model_params)
+
+
+def test_select_viz_indices_reduces_frame_count():
+    steps = _select_viz_indices(10, frame_stride=2, max_frames=4)
+    assert steps == [0, 2, 4, 6, 8, 9]
+
+
+def test_aux_losses_use_input_device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for this regression test")
+    gates = torch.ones(2, 3, 1, device="cuda")
+    assert load_balance_loss(gates).device.type == "cuda"
+    assert router_entropy_loss(gates).device.type == "cuda"
 
 
 def test_end_to_end_loss():

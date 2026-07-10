@@ -18,16 +18,18 @@ from torch import nn
 
 
 class ConvBlock(nn.Module):
-    """Conv -> GroupNorm -> GELU."""
+    """Residual conv block with normalization and GELU activation."""
 
     def __init__(self, in_ch: int, out_ch: int, stride: int = 2):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
+        self.skip = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride)
         self.norm = nn.GroupNorm(min(out_ch // 4, 4), out_ch)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.norm(self.conv(x)))
+        y = self.act(self.norm(self.conv(x)))
+        return y + self.skip(x)
 
 
 class DepthwiseBlock(nn.Module):

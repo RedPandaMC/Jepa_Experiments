@@ -117,6 +117,11 @@ class DeliberationStep(nn.Module):
         self.spatial_side = 4  # 4x4 spatial latent
         assert latent_dim == latent_channels * self.spatial_side * self.spatial_side
 
+        self.pre_norm = nn.LayerNorm(latent_dim)
+        self.post_norm = nn.LayerNorm(latent_dim)
+        self.step_scale = nn.Parameter(torch.tensor(0.25))
+        self.mix = nn.Parameter(torch.tensor(0.5))
+
         # Additive phase (advection): h_flat -> h_add_flat
         self.mlp_add = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -138,12 +143,15 @@ class DeliberationStep(nn.Module):
         Returns:
             h_next: [B, latent_dim] refined latent (residual update).
         """
-        h_add = self.mlp_add(h)  # [B, d]
+        h_norm = self.pre_norm(h)
+        h_add = self.mlp_add(h_norm)  # [B, d]
         # Reshape to spatial for the divergence/projection step.
         h_add_sp = h_add.view(-1, self.latent_channels, self.spatial_side, self.spatial_side)
         h_proj_sp = self.projection(h_add_sp)  # [B, C, 4, 4]
         h_proj = h_proj_sp.flatten(1)  # [B, d]
-        delta = torch.tanh(h_proj)
+        mixed = (1.0 - self.mix) * h_add + self.mix * h_proj
+        delta = self.post_norm(mixed)
+        delta = self.step_scale.tanh() * torch.tanh(delta)
         return h + delta
 
 
@@ -158,6 +166,7 @@ class ViolationHead(nn.Module):
 
     def __init__(self, latent_dim: int = 1024, hidden_dim: int = 1024):
         super().__init__()
+        self.norm = nn.LayerNorm(latent_dim)
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.GELU(),
@@ -166,7 +175,7 @@ class ViolationHead(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """[B, latent_dim] -> [B] scalar violation scores."""
-        return self.net(h).squeeze(-1)
+        return self.net(self.norm(h)).squeeze(-1)
 
 
 class LensBank(nn.Module):
@@ -201,6 +210,8 @@ class LensBank(nn.Module):
                 for _ in range(n_lenses)
             ]
         )
+        self.router_norm = nn.LayerNorm(latent_dim)
+        self.router_temperature = nn.Parameter(torch.tensor(1.0))
         # Router only when there is a real choice to make.
         if n_lenses > 1:
             self.router: nn.Sequential | None = nn.Sequential(
@@ -230,8 +241,8 @@ class LensBank(nn.Module):
             [lens(h) - h for lens in self.lenses], dim=1
         )  # [B, N, d]
 
-        logits = self.router(h)  # type: ignore[misc]  # [B, N]
-        gate = torch.softmax(logits, dim=-1)  # [B, N]
+        logits = self.router(self.router_norm(h))  # type: ignore[misc]  # [B, N]
+        gate = torch.softmax(logits / self.router_temperature.clamp(min=0.5), dim=-1)  # [B, N]
 
         mixed = (gate.unsqueeze(-1) * deltas).sum(dim=1)  # [B, d]
 

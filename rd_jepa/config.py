@@ -32,9 +32,9 @@ class Config:
     # --- model (spatial latent is the only path) ---
     # latent is [B, latent_channels, 4, 4] -> flat latent_dim = latent_channels * 16
     latent_channels: int = 64
-    latent_dim: int = 1024  # = latent_channels * 4 * 4 (kept explicit for clarity)
+    latent_dim: int = 512  # = latent_channels * 4 * 4 (kept explicit for clarity)
     # encoder in_channels = img_channels * 2 (two stacked frames for velocity)
-    hidden_dim: int = 512
+    hidden_dim: int = 256
     encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
     # Lens bank: N specialist lenses soft-routed by a per-step gate.
     # n_lenses=1 disables routing (single-lens path, no router in the graph).
@@ -53,10 +53,10 @@ class Config:
     violation_force_scale: float = 50000.0  # MOVi collision forces are ~1e4-1e5
 
     # --- training ---
-    batch_size: int = 64
+    batch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-5
-    epochs: int = 100
+    epochs: int = 20
     amp_dtype: str = "bfloat16"  # bf16 on Ampere
     grad_checkpoint: bool = False
     ema_decay: float = 0.996
@@ -90,6 +90,12 @@ class Config:
     exp_name: str = "default"
     fast: bool = False  # 500-sample subset for ablations
     vram_fraction: float = 0.95  # set_per_process_memory_fraction guard
+
+    # --- visualization ---
+    viz_every_n_epochs: int = 5  # render gifs every N epochs (default: sparse)
+    viz_frame_stride: int = 2  # decode every Nth latent step for GIFs
+    viz_max_frames: int = 4  # cap GIF length to keep render cost down
+    viz_size: int = 192  # smaller output size for cheaper rendering
 
     # Backward-compat alias: Config(K=15, ...) sets K_max. Removed fields
     # (gate, latent_shape, loss_trajectory, gamma, K, tbptt_n) are rejected

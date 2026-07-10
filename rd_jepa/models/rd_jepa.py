@@ -67,12 +67,6 @@ class RDJEPA(nn.Module):
         """[B, C, 4, 4] -> [B, C*16] if spatial, else passthrough."""
         return x.flatten(1) if self.spatial else x
 
-    def _unflatten(self, x: torch.Tensor) -> torch.Tensor:
-        """[B, C*16] -> [B, C, 4, 4] if spatial, else passthrough."""
-        if self.spatial:
-            return x.view(-1, self.cfg.latent_channels, 4, 4)
-        return x
-
     def _refine_step(
         self, h: torch.Tensor, use_checkpoint: bool
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -120,6 +114,7 @@ class RDJEPA(nn.Module):
         exited = torch.zeros(B, dtype=torch.bool, device=device)
 
         for k in range(K):
+            h = self.latent_norm(h)
             h, v, gate = self._refine_step(h, use_checkpoint)
             all_h.append(h)
             all_v.append(v)

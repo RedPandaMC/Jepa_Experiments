@@ -23,6 +23,21 @@ from PIL import Image
 from ..config import Config
 
 
+def _select_viz_indices(total_steps: int, frame_stride: int = 2, max_frames: int = 4) -> list[int]:
+    """Choose a sparse subset of latent steps to decode for visualization."""
+    if total_steps <= 1:
+        return [0]
+    indices = list(range(0, total_steps, frame_stride))
+    if indices[-1] != total_steps - 1:
+        indices.append(total_steps - 1)
+    if len(indices) > max_frames:
+        step = max(1, len(indices) // max_frames)
+        indices = indices[::step]
+        if indices[-1] != total_steps - 1:
+            indices.append(total_steps - 1)
+    return indices
+
+
 def _to_pil(frame_tensor: torch.Tensor, size: int = 384) -> Image.Image:
     """[C, H, W] float tensor in [0,1] -> PIL RGB image upscaled to `size`.
 
@@ -47,15 +62,20 @@ def write_deliberation_gif(
     out_path: Path,
     size: int = 384,
     duration: int = 200,
+    frame_stride: int = 2,
+    max_frames: int = 4,
 ) -> tuple[Path, list[Image.Image]]:
-    """Save one sample's K latent refinements as an animated gif."""
+    """Save a sparse sample of the latent refinements as an animated gif."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    indices = _select_viz_indices(all_h.shape[0], frame_stride=frame_stride, max_frames=max_frames)
     frames: list[Image.Image] = []
-    for k in range(all_h.shape[0]):
+    for k in indices:
         h = all_h[k, sample_idx]  # [d]
         frame = decoder(h.unsqueeze(0))  # [1, C, H, W]
         frames.append(_to_pil(frame[0], size=size))
+    if not frames:
+        return out_path, []
     frames[0].save(
         out_path,
         save_all=True,
@@ -124,10 +144,20 @@ def render_rollout_for_eval(
     C = cfg.img_channels
     gt_frame = s_target[sample_idx, C : 2 * C, :, :]  # [C, H, W]
     deliberation_path, deliberation_frames = write_deliberation_gif(
-        out["all_h"], decoder, sample_idx, out_dir / f"deliberation_{sample_idx}.gif"
+        out["all_h"],
+        decoder,
+        sample_idx,
+        out_dir / f"deliberation_{sample_idx}.gif",
+        size=cfg.viz_size,
+        frame_stride=cfg.viz_frame_stride,
+        max_frames=cfg.viz_max_frames,
     )
     rollout_path, rollout_img = write_rollout_image(
-        out["h_K"][sample_idx], gt_frame, decoder, out_dir / f"rollout_{sample_idx}.png"
+        out["h_K"][sample_idx],
+        gt_frame,
+        decoder,
+        out_dir / f"rollout_{sample_idx}.png",
+        size=cfg.viz_size,
     )
     return {
         "deliberation_path": deliberation_path,

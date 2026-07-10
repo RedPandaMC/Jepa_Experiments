@@ -198,7 +198,7 @@ def router_entropy_loss(
     Returns 0 when ``gates`` is None (single-lens path).
     """
     if gates is None:
-        return torch.zeros((), device=torch.device("cpu"))
+        return torch.zeros((), device=gates.device if gates is not None else torch.device("cpu"))
     # gates: [K, B, N]
     ent = -(gates * (gates + eps).log()).sum(dim=-1)  # [K, B]
     return ent.mean()
