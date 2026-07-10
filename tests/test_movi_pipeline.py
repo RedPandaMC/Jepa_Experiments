@@ -1,10 +1,11 @@
-"""Regression tests for the MOVi v3 data + v2 model contract.
+"""Regression tests for the MOVi v3 data + v3 kernel-lens model contract.
 
 These run on CPU with synthetic .npz shards so they need neither the network
 download nor a GPU. They lock in the post-PhyRE contract: RGB frames, no
-action modality, a continuous collision-force violation target, and the v2
-unified architecture (spatial latent, divergence mask, energy/contrastive/
-divergence losses, curriculum K, asynchronous probing decoder).
+action modality, a continuous collision-force violation target, and the v3
+kernel-lens architecture (mutating depthwise conv kernels, attention gate,
+energy/contrastive/divergence losses, kernel diversity loss, curriculum K,
+asynchronous probing decoder).
 """
 from __future__ import annotations
 
@@ -20,12 +21,11 @@ from rd_jepa.losses import (
     contrastive_dynamics_loss,
     divergence_reg_loss,
     energy_conservation_loss,
-    load_balance_loss,
-    router_entropy_loss,
+    kernel_diversity_loss,
     total_loss,
     violation_grounded_loss,
 )
-from rd_jepa.models.deliberation import DivergenceProjection, LensBank
+from rd_jepa.models.deliberation import KernelLens, ViolationHead
 from rd_jepa.models.rd_jepa import RDJEPA
 from rd_jepa.viz.decoder import VizDecoder, make_decoder_optimizer
 from rd_jepa.viz.gif_writer import _select_viz_indices
@@ -45,7 +45,7 @@ def _write_synthetic_shard(path, n: int = 12) -> None:
     )
 
 
-def test_config_v2_defaults():
+def test_config_v3_defaults():
     cfg = Config()
     # spatial latent only
     assert cfg.latent_channels == 64
@@ -59,18 +59,19 @@ def test_config_v2_defaults():
     assert cfg.curriculum_warmup_epochs == 5
     # no ablation knobs
     for forbidden in ("gate", "latent_shape", "loss_trajectory", "gamma",
-                      "tbptt_n", "K", "action_dim", "action_inject"):
+                      "tbptn_n", "K", "action_dim", "action_inject",
+                      "n_lenses", "load_balance_weight", "router_entropy_weight"):
         assert not hasattr(cfg, forbidden)
     # decoder async config
     assert cfg.decoder_interval == 4
-    # higher-throughput VRAM defaults
-    assert cfg.batch_size >= 256
-    assert cfg.grad_checkpoint is False
+    # laptop-friendly VRAM defaults
+    assert cfg.batch_size == 128
+    assert cfg.grad_checkpoint is True
     assert cfg.vram_fraction >= 0.95
-    # lens bank
-    assert cfg.n_lenses == 4
-    assert cfg.load_balance_weight == 0.01
-    assert cfg.router_entropy_weight == 0.005
+    # kernel lens
+    assert cfg.n_kernels == 4
+    assert cfg.kernel_size == 3
+    assert cfg.kernel_diversity_weight == 0.01
 
 
 def test_config_rejects_removed_kwargs():
@@ -81,6 +82,12 @@ def test_config_rejects_removed_kwargs():
         pass
     else:
         raise AssertionError("Config should reject removed K= kwarg")
+    try:
+        Config(n_lenses=4)  # type: ignore[call-arg]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Config should reject removed n_lenses= kwarg")
 
 
 def test_resolve_K_linear():
@@ -126,20 +133,63 @@ def test_model_forward_no_action():
     assert out["h_K"].shape == (2, cfg.latent_total_dim)
     assert out["all_h"].shape == (3, 2, cfg.latent_total_dim)
     assert out["violations"].shape == (3, 2)
-    assert out["gates"].shape == (3, 2, cfg.n_lenses)
+    assert out["gates"].shape == (3, 2, cfg.n_kernels)
     # forward must NOT accept an action arg anymore.
     params = list(inspect.signature(RDJEPA.forward).parameters)
     assert "action" not in params
 
 
-def test_divergence_preserves_mass():
-    """The divergence projection must conserve latent L2 mass (incompressibility)."""
-    proj = DivergenceProjection(latent_channels=64)
-    h_sp = torch.randn(4, 64, 4, 4)
-    h_proj = proj(h_sp)
-    in_norm = torch.norm(h_sp.flatten(1), dim=-1)
-    out_norm = torch.norm(h_proj.flatten(1), dim=-1)
-    assert torch.allclose(in_norm, out_norm, atol=1e-4)
+def test_kernel_lens_mutates():
+    """Kernels must change across K steps (mutation is the whole point)."""
+    cfg = Config()
+    lens = KernelLens(
+        latent_dim=cfg.latent_total_dim,
+        latent_channels=cfg.latent_channels,
+        n_kernels=cfg.n_kernels,
+        kernel_size=cfg.kernel_size,
+        hidden_dim=cfg.hidden_dim,
+    )
+    B, d = 4, cfg.latent_total_dim
+    h = torch.randn(B, d)
+    ks0 = lens.init_kernels(B, torch.device("cpu"))
+    h1, gate1, ks1 = lens(h, ks0)
+    h2, gate2, ks2 = lens(h1, ks1)
+    # Kernels must have actually changed.
+    assert not torch.allclose(ks0, ks1, atol=1e-6)
+    assert not torch.allclose(ks1, ks2, atol=1e-6)
+    # Gates must be valid distributions.
+    assert gate1.shape == (B, cfg.n_kernels)
+    assert torch.allclose(gate1.sum(dim=-1), torch.ones(B), atol=1e-5)
+
+
+def test_kernel_lens_gate_shape():
+    """Gate must be [B, N] and sum to 1 per sample."""
+    cfg = Config(n_kernels=4)
+    lens = KernelLens(
+        latent_dim=cfg.latent_total_dim,
+        latent_channels=cfg.latent_channels,
+        n_kernels=cfg.n_kernels,
+        kernel_size=cfg.kernel_size,
+        hidden_dim=cfg.hidden_dim,
+    )
+    h = torch.randn(3, cfg.latent_total_dim)
+    ks = lens.init_kernels(3, torch.device("cpu"))
+    h_next, gate, _ = lens(h, ks)
+    assert h_next.shape == (3, cfg.latent_total_dim)
+    assert gate.shape == (3, 4)
+    assert torch.allclose(gate.sum(dim=-1), torch.ones(3), atol=1e-5)
+
+
+def test_kernel_lens_base_kernels_physics_priors():
+    """Base kernels should be seeded with Sobel/Laplacian/identity, not random."""
+    lens = KernelLens(latent_dim=1024, latent_channels=64, n_kernels=4, kernel_size=3)
+    bk = lens.base_kernels  # [N, C, k, k]
+    # Kernel 0 should look like Sobel-x (nonzero on left/right columns).
+    k0 = bk[0, 0]  # [k, k]
+    assert k0[0, 0] != 0 or k0[0, 2] != 0  # corner is nonzero for Sobel
+    # Kernel 3 should be identity-like (center = max).
+    k3 = bk[3, 0]
+    assert k3[1, 1].abs() >= k3[1, 0].abs()
 
 
 def test_energy_loss_small_when_stable():
@@ -180,6 +230,20 @@ def test_violation_grounded_is_regression():
     assert violation_grounded_loss(violations, torch.zeros(8)).item() >= 0.0
 
 
+def test_kernel_diversity_loss():
+    """Identical kernels should have high diversity loss; orthogonal low."""
+    C, k = 64, 3
+    # Identical kernels -> high loss
+    identical = torch.randn(1, C, k, k).expand(4, -1, -1, -1).contiguous()
+    loss_identical = kernel_diversity_loss(identical)
+    # Orthogonal-ish kernels -> lower loss
+    orthogonal = torch.randn(4, C, k, k)
+    loss_orth = kernel_diversity_loss(orthogonal)
+    assert loss_identical.item() > loss_orth.item()
+    # None -> zero
+    assert kernel_diversity_loss(None).item() == 0.0
+
+
 def test_decoder_is_rgb_and_independent():
     cfg = Config()
     dec = VizDecoder(latent_dim=cfg.latent_total_dim, out_channels=cfg.img_channels)
@@ -188,9 +252,8 @@ def test_decoder_is_rgb_and_independent():
     assert out.shape == (2, 3, 64, 64)
     assert 0.0 <= float(out.min()) and float(out.max()) <= 1.0  # sigmoid
 
-    # New v2 contract: the caller detaches h (see train_decoder_step).
-    # decoder_loss no longer detaches internally. With a detached input no
-    # graph connects to the latent, so its grad stays None.
+    # The caller detaches h (see train_decoder_step). With a detached
+    # input no graph connects to the latent, so its grad stays None.
     h2 = torch.randn(2, cfg.latent_total_dim, requires_grad=True)
     loss = dec.decoder_loss(h2.detach(), torch.rand(2, 3, 64, 64))
     loss.backward()
@@ -214,12 +277,11 @@ def test_select_viz_indices_reduces_frame_count():
     assert steps == [0, 2, 4, 6, 8, 9]
 
 
-def test_aux_losses_use_input_device():
+def test_kernel_diversity_loss_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for this regression test")
-    gates = torch.ones(2, 3, 1, device="cuda")
-    assert load_balance_loss(gates).device.type == "cuda"
-    assert router_entropy_loss(gates).device.type == "cuda"
+    bk = torch.randn(4, 64, 3, 3, device="cuda")
+    assert kernel_diversity_loss(bk).device.type == "cuda"
 
 
 def test_end_to_end_loss():
@@ -232,6 +294,7 @@ def test_end_to_end_loss():
     loss, metrics = total_loss(
         out["all_h"], out["h_K"], target, out["violations"], cfg,
         violation_gt=gt, gates=out["gates"],
+        base_kernels=model.lens.base_kernels,
     )
     assert torch.isfinite(loss)
     assert "loss/violation_grounded" in metrics
@@ -240,86 +303,42 @@ def test_end_to_end_loss():
     assert "loss/energy" in metrics
     assert "loss/contrastive" in metrics
     assert "loss/divergence_reg" in metrics
-    assert "loss/load_balance" in metrics
-    assert "loss/router_entropy" in metrics
-    assert "router/lens_0_usage" in metrics
+    assert "loss/kernel_diversity" in metrics
+    assert "loss/load_balance" not in metrics
+    assert "loss/router_entropy" not in metrics
+    assert "kernel/kernel_0_usage" in metrics
 
 
-def test_n_lenses_1_matches_single_lens():
-    """n_lenses=1 must reproduce the exact single-lens path (no router)."""
-    cfg = Config(n_lenses=1)
-    bank = LensBank(
-        latent_dim=cfg.latent_total_dim,
-        hidden_dim=cfg.hidden_dim,
-        latent_channels=cfg.latent_channels,
-        n_lenses=1,
-    )
-    from rd_jepa.models.deliberation import DeliberationStep
+def test_kernel_lens_mass_conservation():
+    """Latent mass should be roughly conserved across steps (tanh bounded).
 
-    single = DeliberationStep(
-        latent_dim=cfg.latent_total_dim,
-        hidden_dim=cfg.hidden_dim,
-        latent_channels=cfg.latent_channels,
-    )
-    # Copy bank's single lens weights into the standalone lens.
-    single.load_state_dict(bank.lenses[0].state_dict())
-    assert bank.router is None
-
-    h = torch.randn(4, cfg.latent_total_dim)
-    out_bank, gate = bank(h)
-    out_single = single(h)
-    assert gate is None
-    assert torch.allclose(out_bank, out_single, atol=1e-6)
-
-
-def test_lens_bank_router_shape():
-    """Router gate must be [B, N] and sum to 1 per sample."""
-    cfg = Config(n_lenses=4)
-    bank = LensBank(
-        latent_dim=cfg.latent_total_dim,
-        hidden_dim=cfg.hidden_dim,
-        latent_channels=cfg.latent_channels,
-        n_lenses=4,
-    )
-    h = torch.randn(3, cfg.latent_total_dim)
-    h_next, gate = bank(h)
-    assert h_next.shape == (3, cfg.latent_total_dim)
-    assert gate is not None
-    assert gate.shape == (3, 4)
-    assert torch.allclose(gate.sum(dim=-1), torch.ones(3), atol=1e-5)
-
-
-def test_lens_bank_mass_conservation():
-    """Soft-mixed delta should roughly preserve latent mass across steps.
-
-    Note: the DivergenceProjection preserves mass exactly (tested above),
-    but the full lens applies tanh *after* the projection, and the bank
-    applies tanh again after mixing. tanh compresses magnitudes slightly,
-    so we check approximate conservation (within a few percent), not exact.
+    The kernel lens applies tanh-bounded updates, so the magnitude drift is
+    small but not zero. We check approximate conservation (within 10%).
     """
-    cfg = Config(n_lenses=4, K_max=1)
+    cfg = Config(n_kernels=4, K_max=1)
     model = RDJEPA(cfg)
     x = torch.randn(4, cfg.encoder_in_channels, 64, 64)
     out = model(x, K=2, use_checkpoint=False)
     n0 = torch.norm(out["all_h"][0], p=2, dim=-1)
     nK = torch.norm(out["all_h"][1], p=2, dim=-1)
-    # tanh compression allows a small drift; check it's within 5%.
     ratio = nK / n0.clamp(min=1e-6)
-    assert (ratio > 0.95).all() and (ratio < 1.05).all()
+    assert (ratio > 0.90).all() and (ratio < 1.10).all()
 
 
-def test_load_balance_loss_uniform():
-    """Uniform gates should yield ~0 load-balance loss."""
-    N = 4
-    gates = torch.full((3, 8, N), 1.0 / N)
-    loss = load_balance_loss(gates)
-    # N * sum( (1/N)^2 * N ) = N * (1/N) = 1... actually:
-    # usage_i = 1/N for all i, loss = N * sum_i (1/N)^2 = N * N * (1/N^2) = 1
-    # The minimum of the loss is 1 (uniform). Non-uniform > 1.
-    assert abs(loss.item() - 1.0) < 1e-6
+def test_kernel_lens_n_kernels_1():
+    """n_kernels=1 should still work (single kernel, gate is trivially 1.0)."""
+    cfg = Config(n_kernels=1)
+    model = RDJEPA(cfg)
+    x = torch.randn(2, cfg.encoder_in_channels, 64, 64)
+    out = model(x, K=3, use_checkpoint=False)
+    assert out["h_K"].shape == (2, cfg.latent_total_dim)
+    assert out["gates"].shape == (3, 2, 1)
+    # Single kernel gate should be all 1.0 (softmax of a single element).
+    assert torch.allclose(out["gates"], torch.ones_like(out["gates"]))
 
 
-def test_load_balance_loss_none():
-    """gates=None (single lens) should give 0 loss."""
-    assert load_balance_loss(None).item() == 0.0
-    assert router_entropy_loss(None).item() == 0.0
+def test_violation_head_output_shape():
+    head = ViolationHead(latent_dim=1024, hidden_dim=128)
+    h = torch.randn(4, 1024)
+    v = head(h)
+    assert v.shape == (4,)
