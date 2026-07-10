@@ -1,31 +1,27 @@
-"""Regression tests for the MOVi v3 data + v3 kernel-lens model contract.
+"""Regression tests for the MOVi v3 data + v4 simplified kernel-lens model.
 
 These run on CPU with synthetic .npz shards so they need neither the network
 download nor a GPU. They lock in the post-PhyRE contract: RGB frames, no
-action modality, a continuous collision-force violation target, and the v3
-kernel-lens architecture (mutating depthwise conv kernels, attention gate,
-energy/contrastive/divergence losses, kernel diversity loss, curriculum K,
-asynchronous probing decoder).
+action modality, a continuous collision-force violation target, and the v4
+simplified kernel-lens architecture (mutating depthwise conv kernels,
+attention gate, JEPA + VICReg losses only, curriculum K, asynchronous
+probing decoder).
 """
 from __future__ import annotations
 
-import inspect
 import importlib
+import inspect
 import sys
 
 import numpy as np
-import pytest
 import torch
 
 from rd_jepa.config import Config
 from rd_jepa.data.loader import MoviTransitionDataset
 from rd_jepa.losses import (
-    contrastive_dynamics_loss,
-    divergence_reg_loss,
-    energy_conservation_loss,
-    kernel_diversity_loss,
     total_loss,
-    violation_grounded_loss,
+    vicreg_covariance_loss,
+    vicreg_variance_loss,
 )
 from rd_jepa.models.deliberation import KernelLens, ViolationHead
 from rd_jepa.models.rd_jepa import RDJEPA
@@ -47,7 +43,7 @@ def _write_synthetic_shard(path, n: int = 12) -> None:
     )
 
 
-def test_config_v3_defaults():
+def test_config_v4_defaults():
     cfg = Config()
     # spatial latent only
     assert cfg.latent_channels == 64
@@ -57,39 +53,44 @@ def test_config_v3_defaults():
     assert cfg.img_channels == 3
     # curriculum K
     assert cfg.K_min == 1
-    assert cfg.K_max == 15
-    assert cfg.curriculum_warmup_epochs == 5
+    assert cfg.K_max == 3
+    assert cfg.curriculum_warmup_epochs == 3
     # no ablation knobs
     for forbidden in ("gate", "latent_shape", "loss_trajectory", "gamma",
                       "tbptn_n", "K", "action_dim", "action_inject",
-                      "n_lenses", "load_balance_weight", "router_entropy_weight"):
+                      "n_lenses", "load_balance_weight", "router_entropy_weight",
+                      "early_exit", "violation_tau", "violation_weight",
+                      "violation_supervision_weight", "violation_grounded_weight",
+                      "energy_weight", "contrastive_weight", "divergence_reg_weight",
+                      "contrastive_margin", "kernel_diversity_weight"):
         assert not hasattr(cfg, forbidden)
     # decoder async config
     assert cfg.decoder_interval == 4
     # laptop-friendly VRAM defaults
-    assert cfg.batch_size == 128
-    assert cfg.grad_checkpoint is True
-    assert cfg.vram_fraction >= 0.95
+    assert cfg.batch_size == 64
+    assert cfg.grad_checkpoint is False
+    assert cfg.vram_fraction >= 0.90
     # kernel lens
     assert cfg.n_kernels == 4
     assert cfg.kernel_size == 3
-    assert cfg.kernel_diversity_weight == 0.01
+    # data loader
+    assert cfg.num_workers == 4
+    assert cfg.max_cached_shards == 2
+    # simplified losses
+    assert cfg.vicreg_var_weight == 1.0
+    assert cfg.vicreg_cov_weight == 1.0
 
 
 def test_config_rejects_removed_kwargs():
     # dataclasses reject unknown kwargs automatically, but verify.
-    try:
-        Config(K=15)  # type: ignore[call-arg]
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("Config should reject removed K= kwarg")
-    try:
-        Config(n_lenses=4)  # type: ignore[call-arg]
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("Config should reject removed n_lenses= kwarg")
+    for bad in ("K", "n_lenses", "early_exit", "violation_tau",
+                "energy_weight", "contrastive_weight", "kernel_diversity_weight"):
+        try:
+            Config(**{bad: 1})  # type: ignore[call-arg]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f"Config should reject removed {bad}= kwarg")
 
 
 def test_aim_logger_is_noop_when_package_missing():
@@ -106,12 +107,12 @@ def test_aim_logger_is_noop_when_package_missing():
 
 
 def test_resolve_K_linear():
-    cfg = Config(K_min=1, K_max=10, curriculum_warmup_epochs=5)
+    cfg = Config(K_min=1, K_max=3, curriculum_warmup_epochs=3)
     assert cfg.resolve_K(0) == 1  # start at K_min
-    assert cfg.resolve_K(5) == 10  # reached K_max at warmup end
-    assert cfg.resolve_K(100) == 10  # clamped at K_max
+    assert cfg.resolve_K(3) == 3  # reached K_max at warmup end
+    assert cfg.resolve_K(100) == 3  # clamped at K_max
     # monotonic
-    ks = [cfg.resolve_K(e) for e in range(6)]
+    ks = [cfg.resolve_K(e) for e in range(4)]
     assert all(ks[i + 1] >= ks[i] for i in range(len(ks) - 1))
 
 
@@ -129,6 +130,18 @@ def test_loader_yields_rgb_stacked_flat(tmp_path):
     assert v.dtype == torch.float32
 
 
+def test_loader_resizes_to_target_frame_size(tmp_path):
+    """When target_frame_size differs from cached frames, resize on-the-fly."""
+    _write_synthetic_shard(tmp_path / "movi_a_train_shard000.npz")  # 64x64 cache
+    ds = MoviTransitionDataset(
+        tmp_path / "movi_a_train",
+        target_frame_size=32,
+    )
+    ctx, tgt, _v = ds[0]
+    assert ctx.shape == (6, 32, 32)
+    assert tgt.shape == (6, 32, 32)
+
+
 def test_loader_rejects_v2_cache(tmp_path):
     path = tmp_path / "movi_a_train_shard000.npz"
     np.savez_compressed(str(path), s_t=np.zeros((1, 64, 64), np.uint8), version=np.int64(2))
@@ -144,14 +157,16 @@ def test_model_forward_no_action():
     cfg = Config()
     model = RDJEPA(cfg)
     x = torch.randn(2, cfg.encoder_in_channels, 64, 64)
-    out = model(x, K=3, use_checkpoint=False)
+    out = model(x, K=3)
     assert out["h_K"].shape == (2, cfg.latent_total_dim)
     assert out["all_h"].shape == (3, 2, cfg.latent_total_dim)
     assert out["violations"].shape == (3, 2)
     assert out["gates"].shape == (3, 2, cfg.n_kernels)
-    # forward must NOT accept an action arg anymore.
+    # forward must NOT accept an action arg.
     params = list(inspect.signature(RDJEPA.forward).parameters)
     assert "action" not in params
+    assert "early_exit" not in params
+    assert "use_checkpoint" not in params
 
 
 def test_kernel_lens_mutates():
@@ -207,56 +222,23 @@ def test_kernel_lens_base_kernels_physics_priors():
     assert k3[1, 1].abs() >= k3[1, 0].abs()
 
 
-def test_energy_loss_small_when_stable():
-    """Energy conservation loss is ~0 when ||h_K|| ≈ ||h_0||."""
-    h = torch.randn(8, 2, 1024)  # [K, B, d]
-    h[-1] = h[0].clone()  # same magnitude -> zero energy loss
-    loss = energy_conservation_loss(h)
-    assert loss.item() < 1e-6
+def test_vicreg_variance_loss():
+    """Low-variance dimensions should produce high loss."""
+    z_low_var = torch.ones(8, 4) * 0.5  # zero variance -> max loss
+    z_good = torch.randn(8, 4)  # healthy variance -> low loss
+    loss_low = vicreg_variance_loss(z_low_var)
+    loss_good = vicreg_variance_loss(z_good)
+    assert loss_low.item() > loss_good.item()
 
 
-def test_contrastive_loss_penalizes_stasis_when_push():
-    """When violation_gt > 0 and h_K == h_0, contrastive loss should be large."""
-    h = torch.randn(8, 2, 1024)  # [K, B, d]
-    h[-1] = h[0].clone()  # no movement
-    gt = torch.ones(2)  # push present (B=2)
-    loss_push = contrastive_dynamics_loss(h, gt, margin=1.0)
-    gt_none = torch.zeros(2)  # no push
-    loss_none = contrastive_dynamics_loss(h, gt_none, margin=1.0)
-    assert loss_push.item() > 0.5  # margin penalty applies
-    assert loss_none.item() < 1e-6  # no push -> no penalty
-
-
-def test_divergence_reg_finite():
-    h = torch.randn(5, 3, 1024)  # [K, B, d]
-    loss = divergence_reg_loss(h)
-    assert torch.isfinite(loss)
-    # single-step trajectory -> zero
-    assert divergence_reg_loss(torch.randn(1, 3, 1024)).item() == 0.0
-
-
-def test_violation_grounded_is_regression():
-    # smooth-L1 against a continuous [0,1] target (not BCE on a bool).
-    violations = torch.randn(5, 8)
-    gt = torch.rand(8)
-    loss = violation_grounded_loss(violations, gt)
-    assert loss.ndim == 0
-    assert torch.isfinite(loss)
-    assert violation_grounded_loss(violations, torch.zeros(8)).item() >= 0.0
-
-
-def test_kernel_diversity_loss():
-    """Identical kernels should have high diversity loss; orthogonal low."""
-    C, k = 64, 3
-    # Identical kernels -> high loss
-    identical = torch.randn(1, C, k, k).expand(4, -1, -1, -1).contiguous()
-    loss_identical = kernel_diversity_loss(identical)
-    # Orthogonal-ish kernels -> lower loss
-    orthogonal = torch.randn(4, C, k, k)
-    loss_orth = kernel_diversity_loss(orthogonal)
-    assert loss_identical.item() > loss_orth.item()
-    # None -> zero
-    assert kernel_diversity_loss(None).item() == 0.0
+def test_vicreg_covariance_loss():
+    """Correlated dimensions should produce higher loss than uncorrelated."""
+    torch.manual_seed(42)
+    z_uncorr = torch.randn(32, 8)  # roughly uncorrelated
+    z_corr = torch.randn(32, 4).repeat(1, 2)  # duplicated -> highly correlated
+    loss_uncorr = vicreg_covariance_loss(z_uncorr)
+    loss_corr = vicreg_covariance_loss(z_corr)
+    assert loss_corr.item() > loss_uncorr.item()
 
 
 def test_decoder_is_rgb_and_independent():
@@ -292,36 +274,25 @@ def test_select_viz_indices_reduces_frame_count():
     assert steps == [0, 2, 4, 6, 8, 9]
 
 
-def test_kernel_diversity_loss_device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for this regression test")
-    bk = torch.randn(4, 64, 3, 3, device="cuda")
-    assert kernel_diversity_loss(bk).device.type == "cuda"
-
-
 def test_end_to_end_loss():
     cfg = Config()
     model = RDJEPA(cfg)
     x = torch.randn(4, cfg.encoder_in_channels, 64, 64)
-    out = model(x, K=4, use_checkpoint=False)
+    out = model(x, K=3)
     target = model.target(torch.randn(4, cfg.encoder_in_channels, 64, 64))
-    gt = torch.rand(4)
-    loss, metrics = total_loss(
-        out["all_h"], out["h_K"], target, out["violations"], cfg,
-        violation_gt=gt, gates=out["gates"],
-        base_kernels=model.lens.base_kernels,
-    )
+    loss, metrics = total_loss(out["h_K"], target, cfg)
     assert torch.isfinite(loss)
-    assert "loss/violation_grounded" in metrics
-    assert "loss/jepa" in metrics  # final-only (no 'loss/trajectory')
-    assert "loss/trajectory" not in metrics
-    assert "loss/energy" in metrics
-    assert "loss/contrastive" in metrics
-    assert "loss/divergence_reg" in metrics
-    assert "loss/kernel_diversity" in metrics
+    assert "loss/jepa" in metrics
+    assert "loss/vicreg_variance" in metrics
+    assert "loss/vicreg_covariance" in metrics
+    assert "loss/total" in metrics
+    # No trajectory losses
+    assert "loss/energy" not in metrics
+    assert "loss/contrastive" not in metrics
+    assert "loss/divergence_reg" not in metrics
     assert "loss/load_balance" not in metrics
     assert "loss/router_entropy" not in metrics
-    assert "kernel/kernel_0_usage" in metrics
+    assert "loss/kernel_diversity" not in metrics
 
 
 def test_kernel_lens_mass_conservation():
@@ -333,7 +304,7 @@ def test_kernel_lens_mass_conservation():
     cfg = Config(n_kernels=4, K_max=1)
     model = RDJEPA(cfg)
     x = torch.randn(4, cfg.encoder_in_channels, 64, 64)
-    out = model(x, K=2, use_checkpoint=False)
+    out = model(x, K=2)
     n0 = torch.norm(out["all_h"][0], p=2, dim=-1)
     nK = torch.norm(out["all_h"][1], p=2, dim=-1)
     ratio = nK / n0.clamp(min=1e-6)
@@ -345,7 +316,7 @@ def test_kernel_lens_n_kernels_1():
     cfg = Config(n_kernels=1)
     model = RDJEPA(cfg)
     x = torch.randn(2, cfg.encoder_in_channels, 64, 64)
-    out = model(x, K=3, use_checkpoint=False)
+    out = model(x, K=3)
     assert out["h_K"].shape == (2, cfg.latent_total_dim)
     assert out["gates"].shape == (3, 2, 1)
     # Single kernel gate should be all 1.0 (softmax of a single element).

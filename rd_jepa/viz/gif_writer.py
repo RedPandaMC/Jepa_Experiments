@@ -139,7 +139,7 @@ def render_rollout_for_eval(
     s_context = s_context.to(device)
     s_target = s_target.to(device)
     with torch.no_grad():
-        out = model(s_context, K=cfg.K_max, early_exit=cfg.early_exit, tau=cfg.violation_tau)
+        out = model(s_context, K=cfg.K_max)
     # GT visualization: second frame of target (s_{t+1}), channels [C:2C].
     C = cfg.img_channels
     gt_frame = s_target[sample_idx, C : 2 * C, :, :]  # [C, H, W]

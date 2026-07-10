@@ -1,4 +1,4 @@
-r"""Top-level RD-JEPA v3 model: encode -> K-step kernel-lens refinement -> early exit.
+r"""Top-level RD-JEPA v4 model: encode -> K-step kernel-lens refinement.
 
 The lens is a ``KernelLens`` — a bank of N depthwise conv kernels on the
 spatial latent that mutate per-sample during the K deliberation steps. The
@@ -9,23 +9,21 @@ meaningful: different inputs produce different kernel trajectories.
 The latent is spatial ``[B, latent_channels, 4, 4]`` from the encoder,
 flattened to ``[B, d]`` for the deliberation loop (the kernel lens reshapes
 internally). This keeps the external interface (losses, decoder, probe)
-unchanged from v2.
+unchanged from v3.
 
 Cache v3 input (MOVi): two stacked RGB frames (s_{t-1}, s_t) for context
 and (s_t, s_{t+1}) for target, providing velocity information.
 
 The loop returns:
-  - h_K: the final (or early-exited) latent per sample.
-  - k_used: per-sample number of steps actually taken (<= K).
-  - all_h: stack of intermediate latents [K, B, d].
-  - violations: [K, B] violation scores at each step.
+  - h_K: the final latent per sample.
+  - all_h: stack of intermediate latents [K, B, d] (for visualization).
+  - violations: [K, B] violation scores at each step (diagnostic only).
   - gates: [K, B, N] kernel attention weights at each step.
 """
 from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from ..config import Config
 from .deliberation import KernelLens, ViolationHead
@@ -69,19 +67,10 @@ class RDJEPA(nn.Module):
         return x.flatten(1) if self.spatial else x
 
     def _refine_step(
-        self, h: torch.Tensor, kernel_state: torch.Tensor, use_checkpoint: bool
+        self, h: torch.Tensor, kernel_state: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """One kernel-lens application; returns (h_next, violation_k, gate_k, ks_new)."""
-
-        def run(
-            hh: torch.Tensor, ks: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            return self.lens(hh, ks)  # type: ignore[no-any-return]
-
-        if use_checkpoint and h.requires_grad:
-            h_next, gate, ks_new = checkpoint(run, h, kernel_state, use_reentrant=False)
-        else:
-            h_next, gate, ks_new = run(h, kernel_state)
+        h_next, gate, ks_new = self.lens(h, kernel_state)
         v = self.violation(h_next)
         return h_next, v, gate, ks_new
 
@@ -89,9 +78,6 @@ class RDJEPA(nn.Module):
         self,
         s_context: torch.Tensor,
         K: int | None = None,
-        early_exit: bool = False,
-        tau: float = 0.1,
-        use_checkpoint: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Run the deliberation loop.
 
@@ -99,9 +85,6 @@ class RDJEPA(nn.Module):
             s_context: [B, C_in, H, W] stacked context frames (s_{t-1}, s_t).
                 C_in = 2 * img_channels (e.g. 6 for RGB).
             K: override cfg.K_max if set (used by the curriculum schedule).
-            early_exit: enable per-sample early exit on violation < tau.
-            tau: violation threshold for early exit.
-            use_checkpoint: gradient-checkpoint each lens step.
         """
         K = K if K is not None else self.cfg.K_max
         B = s_context.shape[0]
@@ -116,37 +99,18 @@ class RDJEPA(nn.Module):
         all_h: list[torch.Tensor] = []
         all_v: list[torch.Tensor] = []
         all_gates: list[torch.Tensor] = []
-        k_used = torch.full((B,), K, device=device, dtype=torch.long)
-        exited = torch.zeros(B, dtype=torch.bool, device=device)
 
-        for k in range(K):
-            h = self.latent_norm(h)
-            h, v, gate, kernel_state = self._refine_step(h, kernel_state, use_checkpoint)
+        for _k in range(K):
+            h, v, gate, kernel_state = self._refine_step(h, kernel_state)
             all_h.append(h)
             all_v.append(v)
             all_gates.append(gate)
 
-            if early_exit and not exited.all():
-                below = (v < tau) & (~exited)
-                newly = below & (k_used == K)
-                k_used = torch.where(newly, torch.full_like(k_used, k + 1), k_used)
-                exited = exited | below
-                if exited.all():
-                    remainder = K - (k + 1)
-                    for _ in range(remainder):
-                        all_h.append(h)
-                        all_v.append(v)
-                        all_gates.append(gate)
-                    break
-
-        gates_stack = torch.stack(all_gates, dim=0)  # [K, B, N]
-
         return {
             "h_K": h,
-            "k_used": k_used,
             "all_h": torch.stack(all_h, dim=0),  # [K, B, d]
             "violations": torch.stack(all_v, dim=0),  # [K, B]
-            "gates": gates_stack,  # [K, B, N]
+            "gates": torch.stack(all_gates, dim=0),  # [K, B, N]
         }
 
     def target(self, s_target: torch.Tensor) -> torch.Tensor:

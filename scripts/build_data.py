@@ -354,8 +354,8 @@ def main() -> None:
                    help="cap train shards (default 50; bound work for an 8GB laptop)")
     p.add_argument("--force-scale", type=float, default=1.0,
                    help="collision-force divisor (run --scan-scale to tune)")
-    p.add_argument("--frame-size", type=int, default=256,
-                   help="downsample frames to this resolution (default 256)")
+    p.add_argument("--frame-size", type=int, default=128,
+                    help="downsample frames to this resolution (default 128)")
     p.add_argument("--dev-only", action="store_true",
                    help="only build the dev (validation) split")
     p.add_argument("--scan-scale", action="store_true",

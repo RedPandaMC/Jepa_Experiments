@@ -1,16 +1,16 @@
-"""Training loop for RD-JEPA v2.
+"""Training loop for RD-JEPA v4.
 
 Implements spec §3.1 VRAM survival:
-  - gradient checkpointing inside the K-loop (handled in the model)
   - bf16 autocast (Ampere-native)
   - set_per_process_memory_fraction guard to avoid OOM-killing Windows.
 
-v2 core fixes wired in here:
+v4 simplifications wired in here:
   - Curriculum K: per-epoch K_min -> K_max schedule (cfg.resolve_K(epoch)).
-    Both train_step and eval_step use the epoch's K (K_epoch).
+  - Simplified 3-loss surface (JEPA + VICReg only).
+  - No gradient checkpointing (model is small enough without it).
+  - No early exit during training (always run full K steps).
   - Asynchronous probing decoder: trained in its own optimizer + backward
-    pass on a detached h_K, every cfg.decoder_interval JEPA steps. Zero
-    gradient entanglement with the JEPA loop.
+    pass on a detached h_K, every cfg.decoder_interval JEPA steps.
 
 Logs scalars and a VRAM-budget table to Aim.
 """
@@ -114,8 +114,10 @@ def vram_budget_table(cfg: Config, k_epoch: int) -> str:
         f"  K_max (deliberation): {cfg.K_max}  (this epoch K={k_epoch})",
         f"  n_kernels (kernel lens): {cfg.n_kernels}",
         f"  kernel_size         : {cfg.kernel_size}",
+        f"  frame_size          : {cfg.frame_size}",
         f"  AMP dtype           : {cfg.amp_dtype}",
         f"  grad checkpoint     : {cfg.grad_checkpoint}",
+        f"  num_workers         : {cfg.num_workers}",
         f"  decoder interval    : every {cfg.decoder_interval} JEPA steps",
     ]
     return "\n".join(lines)
@@ -136,31 +138,17 @@ def train_step(
         k_epoch: the curriculum-resolved K for this epoch.
     """
     # v3 batch: (context[2*C,H,W], target[2*C,H,W], violation_gt[1])
-    s_context, s_target, violation_gt = batch
+    s_context, s_target, _violation_gt = batch
     s_context = s_context.cuda(non_blocking=True)
     s_target = s_target.cuda(non_blocking=True)
-    violation_gt = violation_gt.cuda(non_blocking=True)
 
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16
 
     with autocast("cuda", dtype=amp_dtype):
-        out = model(
-            s_context,
-            K=k_epoch,
-            early_exit=False,  # train on full K for stable loss
-            use_checkpoint=cfg.grad_checkpoint,
-        )
+        out = model(s_context, K=k_epoch)
         target = model.target(s_target)
-        loss, metrics = total_loss(
-            out["all_h"],
-            out["h_K"],
-            target,
-            out["violations"],
-            cfg,
-            violation_gt=violation_gt,
-            gates=out["gates"],
-            base_kernels=model.lens.base_kernels,
-        )
+        loss, metrics = total_loss(out["h_K"], target, cfg)
+
     # Widen to dict[str, Any] so we can stash transient tensors for the
     # asynchronous decoder step without violating the loss's float contract.
     m: dict[str, Any] = {**metrics}
@@ -177,7 +165,6 @@ def train_step(
     # EMA target update
     model.target_encoder.update_ema(model.encoder, step=step, warmup=cfg.ema_warmup)
 
-    m["train/k_used_mean"] = out["k_used"].float().mean().item()
     m["train/K_epoch"] = float(k_epoch)
     if torch.cuda.is_available():
         m["train/vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
@@ -241,34 +228,17 @@ def eval_step(
 ) -> dict[str, float]:
     """One eval step. Uses the curriculum-resolved K (same as training)."""
     # v3 batch: (context[2*C,H,W], target[2*C,H,W], violation_gt[1])
-    s_context, s_target, violation_gt = batch
+    s_context, s_target, _violation_gt = batch
     s_context = s_context.cuda(non_blocking=True)
     s_target = s_target.cuda(non_blocking=True)
-    violation_gt = violation_gt.cuda(non_blocking=True)
 
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16
     with autocast("cuda", dtype=amp_dtype):
-        out = model(
-            s_context,
-            K=k_epoch,
-            early_exit=cfg.early_exit,
-            tau=cfg.violation_tau,
-            use_checkpoint=False,
-        )
+        out = model(s_context, K=k_epoch)
         target = model.target(s_target)
-        loss, metrics = total_loss(
-            out["all_h"],
-            out["h_K"],
-            target,
-            out["violations"],
-            cfg,
-            violation_gt=violation_gt,
-            gates=out["gates"],
-            base_kernels=model.lens.base_kernels,
-        )
+        loss, metrics = total_loss(out["h_K"], target, cfg)
     # rename metrics to eval/ prefix
     metrics = {k.replace("loss/", "eval/loss/"): v for k, v in metrics.items()}
-    metrics["eval/k_used_mean"] = out["k_used"].float().mean().item()
     metrics["eval/K_epoch"] = float(k_epoch)
 
     # Collapse diagnostics on the final latent
@@ -406,7 +376,6 @@ def train(cfg: Config, logger: AimLogger | None = None) -> None:
             f"epoch {epoch} eval: "
             f"loss={eval_metrics.get('eval/loss/total', 0):.4f} "
             f"K={eval_metrics.get('eval/K_epoch', 0):.0f} "
-            f"k_used={eval_metrics.get('eval/k_used_mean', 0):.1f} "
             f"probe_r2={eval_metrics.get('eval/probe/r2', 0):.3f}"
         )
 

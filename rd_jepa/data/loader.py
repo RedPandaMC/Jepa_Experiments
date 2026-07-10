@@ -14,6 +14,10 @@ Shards are loaded **lazily** with an LRU cache: only a few shards live in
 RAM at a time, so the dataset scales to large caches (256x256 frames)
 without OOM. Shard metadata (offsets, frame_size) is scanned at init
 without decompressing the frame arrays.
+
+If the cached frame_size differs from the configured target, frames are
+resized on-the-fly in __getitem__ (bilinear). This lets training proceed
+even when the cache was built at a different resolution.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from ..config import Config
@@ -54,11 +59,19 @@ class MoviTransitionDataset(Dataset):
 
     Reads the sharded .npz cache (v3) produced by scripts/build_data.py.
     Shards are loaded lazily via an LRU cache so only a handful live in RAM
-    at any time — critical for 256x256 caches that would OOM if loaded
-    eagerly. Indexing is translated across shards via cumulative offsets.
+    at any time. Indexing is translated across shards via cumulative offsets.
+
+    If ``target_frame_size`` is set and differs from the cached frame size,
+    frames are resized on-the-fly (bilinear) so training can proceed with
+    a cache built at a different resolution.
     """
 
-    def __init__(self, npz_path: str | Path, max_cached_shards: int = 4):
+    def __init__(
+        self,
+        npz_path: str | Path,
+        max_cached_shards: int = 4,
+        target_frame_size: int | None = None,
+    ):
         path = Path(npz_path)
         stem = path.stem  # e.g. "movi_a_train"
         parent = path.parent
@@ -107,6 +120,14 @@ class MoviTransitionDataset(Dataset):
 
         self._cache = _ShardCache(max_cached=max_cached_shards)
 
+        # If target_frame_size is set and differs from cached frames,
+        # we resize on-the-fly in __getitem__.
+        self.target_frame_size = target_frame_size
+        self._needs_resize = (
+            target_frame_size is not None
+            and target_frame_size != self.frame_size
+        )
+
     def _load_shard(self, shard_idx: int) -> dict[str, np.ndarray]:
         sp = self._shard_paths[shard_idx]
 
@@ -131,6 +152,18 @@ class MoviTransitionDataset(Dataset):
         local_idx = idx - self._offsets[shard_idx]
         return shard_idx, local_idx
 
+    def _to_tensor(self, frame: np.ndarray) -> torch.Tensor:
+        """[H, W, C] uint8 numpy -> [C, H, W] float in [0,1], resized if needed."""
+        t = torch.from_numpy(frame).float().div(255.0).permute(2, 0, 1)
+        if self._needs_resize and self.target_frame_size is not None:
+            t = F.interpolate(
+                t.unsqueeze(0),
+                size=(self.target_frame_size, self.target_frame_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        return t
+
     def __getitem__(
         self, idx: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -143,15 +176,9 @@ class MoviTransitionDataset(Dataset):
         shard_idx, local_idx = self._shard_for(idx)
         shard = self._load_shard(shard_idx)
         # Normalize RGB to [0,1]. Frames stored as [H, W, C] uint8.
-        s_tm1 = torch.from_numpy(
-            shard["s_tm1"][local_idx]
-        ).float().div(255.0).permute(2, 0, 1)  # [C, H, W]
-        s_t = torch.from_numpy(
-            shard["s_t"][local_idx]
-        ).float().div(255.0).permute(2, 0, 1)
-        s_tp1 = torch.from_numpy(
-            shard["s_tp1"][local_idx]
-        ).float().div(255.0).permute(2, 0, 1)
+        s_tm1 = self._to_tensor(shard["s_tm1"][local_idx])  # [C, H, W]
+        s_t = self._to_tensor(shard["s_t"][local_idx])
+        s_tp1 = self._to_tensor(shard["s_tp1"][local_idx])
         # Stack: context = (s_{t-1}, s_t), target = (s_t, s_{t+1}); flatten to
         # [2*C, H, W] (frame-major, channel-minor) for the encoder.
         context = torch.stack(
@@ -177,12 +204,17 @@ def build_dataloaders(cfg: Config) -> dict[str, DataLoader]:
     shard = f"{cfg.movi_variant}_{{split}}.npz"
 
     def make_loader(split: str, shuffle: bool, drop_last: bool) -> DataLoader:
-        ds = MoviTransitionDataset(base / shard.format(split=split))
+        ds = MoviTransitionDataset(
+            base / shard.format(split=split),
+            max_cached_shards=cfg.max_cached_shards,
+            target_frame_size=cfg.frame_size,
+        )
         return DataLoader(
             ds,
             batch_size=cfg.batch_size,
             shuffle=shuffle,
-            num_workers=0,  # lazy shard cache; forking would duplicate it
+            num_workers=cfg.num_workers,
+            persistent_workers=cfg.num_workers > 0,
             pin_memory=True,
             drop_last=drop_last,
         )
