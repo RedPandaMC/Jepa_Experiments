@@ -23,7 +23,7 @@ class Config:
     movi_variant: str = "movi_a"  # one of movi_a/b/c/d/e
     movi_resolution: int = 128  # source resolution to download (128 or 256)
     split: str = "train"  # tfds split name (train/validation/test)
-    frame_size: int = 256  # frames are downsampled to this during conversion
+    frame_size: int = 128  # frames are downsampled to this during conversion
     img_channels: int = 3  # RGB (MOVi is RGB, not PhyRE scene-id maps)
     cache_dir: Path = Path("data/cache")
     runs_dir: Path = Path("runs")
@@ -53,12 +53,12 @@ class Config:
     violation_force_scale: float = 50000.0  # MOVi collision forces are ~1e4-1e5
 
     # --- training ---
-    batch_size: int = 32
+    batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 1e-5
     epochs: int = 100
     amp_dtype: str = "bfloat16"  # bf16 on Ampere
-    grad_checkpoint: bool = True
+    grad_checkpoint: bool = False
     ema_decay: float = 0.996
     ema_warmup: int = 100
 
@@ -89,7 +89,7 @@ class Config:
     # --- experiment ---
     exp_name: str = "default"
     fast: bool = False  # 500-sample subset for ablations
-    vram_fraction: float = 0.7  # set_per_process_memory_fraction guard
+    vram_fraction: float = 0.95  # set_per_process_memory_fraction guard
 
     # Backward-compat alias: Config(K=15, ...) sets K_max. Removed fields
     # (gate, latent_shape, loss_trajectory, gamma, K, tbptt_n) are rejected

@@ -61,6 +61,10 @@ def test_config_v2_defaults():
         assert not hasattr(cfg, forbidden)
     # decoder async config
     assert cfg.decoder_interval == 4
+    # higher-throughput VRAM defaults
+    assert cfg.batch_size >= 64
+    assert cfg.grad_checkpoint is False
+    assert cfg.vram_fraction >= 0.95
     # lens bank
     assert cfg.n_lenses == 4
     assert cfg.load_balance_weight == 0.01
