@@ -1,26 +1,13 @@
-# RD-JEPA: Recurrent Deliberation JEPA
+# RD-JEPA
 
-*A latent-space physics world model that buys prediction quality with test-time compute — via mutating convolution kernels that literally evolve per sample.*
-
-**RD-JEPA** is a latent-space world model that utilizes **test-time compute**
-to perform iterative physical refinement. Instead of a single feed-forward
-pass, it runs an internal "thinking loop" — a **Kernel Lens** of N=4
-depthwise conv kernels that **mutate per-sample** during $K$ deliberation
-steps, carving physical impossibilities away until the latent is sharp.
-Trained as a Joint-Embedding Predictive Architecture (JEPA), it never decodes
-pixels during the thinking loop; an asynchronous probing decoder provides an
-on-demand "viewport" for visualization.
-
-> **Target.** Consumer GPU (NVIDIA RTX 3070, 8GB VRAM). Dataset: Kubric
-> MOVi-A (pre-rendered rigid-body collisions of CLEVER-style shapes),
-> passive video — no action modality.
+A compact latent-space world model for rigid-body physics. Instead of predicting pixels directly, it refines a spatial latent representation by running a thinking loop: 4 depthwise convolution kernels that **evolve per-sample** over $K$ steps to carve away physical impossibilities. Built for consumer GPUs (8GB VRAM, tested on RTX 3070). Trained on Kubric MOVi-A.
 
 <p align="center">
   <img src="docs/architecture.png" alt="RD-JEPA v3 architecture" width="100%"/>
 </p>
 <p align="sub"><b>Figure 1.</b> The RD-JEPA v3 pipeline. A spatial latent
 <b>[B, 64, 4, 4]</b> (flat 1024 externally) is refined <i>K</i> times by a
-<b>Kernel Lens</b> — a bank of N=4 depthwise conv kernels that mutate
+<b>Kernel Lens</b>, a bank of N=4 depthwise conv kernels that mutate
 per-sample via a mutator network (test-time compute has real meaning: different
 inputs → different kernel trajectories). An attention gate selects which
 kernels to activate at each step. Energy, contrastive, divergence, and kernel-
@@ -31,315 +18,134 @@ entangling gradients with the thinking loop.
 
 ---
 
-## 1. Introduction
+## How it works
 
-Standard feed-forward world predictors throw away the whole camera at each
-step and rebuild the world from scratch. RD-JEPA keeps one camera and
-**twists a bank of N conv kernels** $K$ times: each tiny twist carves a
-physical impossibility away until the latent image is sharp and viable. The
-kernels are not static — they **mutate per-sample** based on the latent state,
-so test-time compute is genuine computation, not just a repeated fixed
-function. The kernel bank is one set of weights reused at every step, so
-VRAM is **constant** in $K$ — whether the model thinks for 3 steps or 50, the
-memory footprint does not move. This is what makes the loop tractable on 8 GB.
+Most world models rebuild the scene from scratch at each timestep. RD-JEPA keeps a spatial latent representation and **refines it in place** by iteratively applying learned convolution kernels. Each kernel adapts per-sample (different inputs → different kernels), so the "refinement" is actually meaningful computation, not a fixed function repeated $K$ times.
 
-The loop is not guessing the future; it is performing an optimization
-*inside* latent space, tweaking the representation until the "energy" of
-physical violations approaches zero. RD-JEPA is an iterative **constraint
-solver**, not a brute-force sequence generator. Because each step is a
-monotonic residual refinement, a violation head $V_\psi$ can terminate the
-loop as soon as the state is physically sound: trivial problems stop at
-$k\!\approx\!2$, hard ones run the full $K$. **Dynamic thinking** emerges for
-free from this residual setup.
+The loop terminates early when the model is confident (< 0.1 violation score), so easy predictions stop at ~2 steps while hard collisions run the full 15. VRAM stays constant regardless of $K$ because the kernels are weight-shared (only activations grow, and gradient checkpointing keeps those in check).
 
-### Contributions (v3)
+### v3 improvements
 
-The v3 architecture replaces the v2 MoE lens bank (N parallel MLPs + a
-degenerate soft-routing router) with a **mutating kernel lens**:
+- **Depthwise conv kernels instead of MLPs**: spatial inductive bias, ~0.33M params vs 4.4M in v2
+- **Per-sample kernel mutation**: the kernels evolve based on the latent, not static
+- **Attention gate instead of MoE router**: lightweight and stable
+- **Asynchronous decoder**: RGB visualization without polluting gradients
+- **Grounded training signal**: MOVi's per-frame collision force for the violation head
 
-1. **Kernels as lenses on the latent space** — each lens is a depthwise conv
-   kernel `[C, 3, 3]` applied to the spatial latent `[B, C, 4, 4]` via
-   `unfold` + `einsum` (per-sample, per-channel). This gives genuine spatial
-   inductive bias (detecting/producing local field patterns) rather than
-   unconstrained MLPs on a flat vector.
-2. **Mutating kernels (test-time compute)** — the kernel state
-   `[B, N, C, 3, 3]` is initialized from learned base kernels (seeded with
-   Sobel-x, Sobel-y, Laplacian, identity priors) and **evolves per-sample**
-   during the $K$ steps. A mutator network reads the pooled latent and
-   produces per-sample kernel deltas each step — the kernels literally
-   transform based on what the latent looks like. Different inputs → different
-   kernel trajectories. The `step_scale` and `mutation_scale` are learnable
-   and `tanh`-bounded.
-3. **Attention gate, not MoE router** — a lightweight LayerNorm + MLP →
-   softmax gate selects which kernels to activate at each step. No
-   load-balance loss, no router-entropy loss. A `kernel_diversity_loss`
-   (pairwise cosine similarity between base kernels) prevents all kernels
-   from collapsing to identical filters.
-4. **Asynchronous probing decoder** — a lightweight RGB decoder trained in
-   its own optimizer + backward pass on a *detached* $h_K$, every 4 JEPA
-   steps. Zero gradient entanglement with the thinking loop; the JEPA acts
-   as the physics engine and the decoder acts as the GPU renderer.
-5. **Anti-collapse training** — Latent Energy Conservation
-   ($|\,\|h_K\|-\|h_0\|\,|^2$), a Contrastive Dynamics margin loss gated
-   by the grounded collision signal, a per-step Divergence Regularizer, and
-   a curriculum-K schedule $K_{\min}\!\to\!K_{\max}$ that prevents the lens
-   from collapsing to a static universe under BPTT.
+The result: **test-time compute that actually computes** (different inputs produce different refinement trajectories).
 
-## 2. Method
+## Architecture
 
-### 2.1 Vision backbone
+**Encoder** ($E_\theta$): stacked context frames $(s_{t-1}, s_t)$ → spatial latent $h_0 \in \mathbb{R}^{B \times 64 \times 4 \times 4}$. Lightweight 4-layer CNN + ConvNeXt-style depthwise block. An EMA copy produces stop-gradient targets (BYOL-style).
 
-A lightweight 4-layer strided CNN (Conv→GroupNorm→GELU, stride 2) ending in
-a ConvNeXt-flavored depthwise block and a 1×1 conv head maps the stacked
-context frames $(s_{t-1}, s_t)$ to a **spatial latent**
-$h_0 \in \mathbb{R}^{C\times4\times4}$ ($C{=}64$, flat $d{=}1024$). Spatial
-structure is mandatory: the kernel lens operates on the 2D field directly.
+**Kernel Lens** ($K$ steps): 
+1. **Depthwise convolution**: each of 4 kernels $K_n \in \mathbb{R}^{64 \times 3 \times 3}$ is applied per-sample to the spatial latent via unfold+einsum
+2. **Attention gate**: lightweight MLP selects which kernels to activate
+3. **Residual update**: gated sum added back to latent
+4. **Kernel mutation**: mutator network reads the updated latent and evolves each kernel for the next step
 
-An EMA copy $E_{\bar\theta}$ (decay $0.996$) of the encoder produces the
-stop-gradient JEPA target from $(s_t, s_{t+1})$. There is **no action
-modality** — MOVi is passive video, so the kernel lens refines a purely
-visual latent.
+Kernels are seeded with Sobel-x, Sobel-y, Laplacian, identity filters.
 
-### 2.2 The Kernel Lens: mutating depthwise conv kernels
+**Violation head** ($V_\psi$): predicts "physical error" on the latent. If score < 0.1, loop exits early. Trained on grounded collision forces from MOVi.
 
-At each deliberation step $k \in \{1,\dots,K\}$ the kernel lens applies N
-depthwise conv kernels to the spatial latent, gates them by attention, and
-mutates the kernels for the next step. The full step is:
+**VizDecoder** (separate optimizer): 4 deconv blocks decode $h_K$ to RGB for visualization, detached from JEPA gradients.
 
-**Step 1 — Per-sample depthwise convolution.** The flat latent is reshaped
-to spatial $h_{\mathrm{sp}} \in \mathbb{R}^{B\times C\times4\times4}$ and
-unfolding extracts sliding-window patches
-$P \in \mathbb{R}^{B\times C\times k^2\times L}$. Each per-sample kernel
-$K_n \in \mathbb{R}^{C\times3\times3}$ is applied via einsum:
+## Training
 
-$$\delta_n = \mathrm{einsum}\big(\text{`bnck,bckl\to bncl`},\; K_n,\; P\big) \quad\to\; [B, C, 16]$$
+**Losses** (balance prevents mode collapse):
 
-This is a per-sample, per-channel depthwise convolution — each sample has its
-own evolved kernels, not shared ones.
+| Loss | Weight | Notes |
+|---|---|---|
+| JEPA (final-only MSE) | 1.0 | predict $h_K$ from target |
+| Energy conservation | 0.1 | prevent zeroing latent magnitude |
+| Contrastive dynamics | 0.05 | penalize stasis when collision exists |
+| Divergence regularization | 0.05 | constant per-step density |
+| Violation aux | 0.01 | monotonic exit score |
+| Violation grounded | 0.1 | predict collision force (grounded signal) |
+| VICReg (var + cov) | 1.0 / 1.0 | collapse safety |
+| Kernel diversity | 0.01 | prevent filter duplication |
 
-**Step 2 — Attention gate.** The pooled latent $\bar{h} = \mathrm{mean}(h_{\mathrm{sp}}) \in \mathbb{R}^{B\times C}$
-is passed through a LayerNorm + MLP → softmax to produce attention weights:
+**Memory budget** (8GB VRAM):
 
-$$g = \mathrm{softmax}\!\Big(\frac{\mathrm{MLP}(\mathrm{LN}(\bar{h}))}{T}\Big) \in \mathbb{R}^N, \quad [B, N]$$
+- Gradient checkpointing inside the $K$-loop (on by default)
+- Weight sharing: one kernel bank reused all $K$ steps
+- BF16 autocast on Ampere
+- $K$-independent VRAM: activations scale linearly in $K$, not weights
 
-where $T$ is a learnable temperature (clamped $\geq 0.5$).
+**Curriculum**: $K$ ramps from 1 → 15 over first 5 epochs to stabilize training.
 
-**Step 3 — Gated sum + residual update.** The per-kernel spatial deltas are
-combined by the gate, bounded by `tanh`, and added residually:
+## Getting started
 
-$$h_k = h_{k-1} + \tanh(s_{\mathrm{step}}) \cdot \tanh\!\Big(\sum_{n=1}^{N} g_n \, \delta_n\Big)$$
-
-where $s_{\mathrm{step}}$ is a learnable scale bounded by `tanh`.
-
-**Step 4 — Kernel mutation (test-time compute).** A mutator network reads the
-*updated* pooled latent and produces per-sample kernel deltas:
-
-$$\Delta K = \tanh\big(s_{\mathrm{mut}}\big) \cdot \tanh\!\big(\mathrm{MLP}_{\mathrm{mut}}(\mathrm{mean}(h_k))\big)$$
-$$K_k = K_{k-1} + \Delta K \quad\to\; [B, N, C, 3, 3]$$
-
-The kernels **literally evolve** — this is the test-time compute: different
-inputs produce different kernel trajectories. $s_{\mathrm{mut}}$ is a
-learnable scale bounded by `tanh`. The mutated kernels feed into the next
-step's convolution.
-
-**Initialization.** The base kernels are seeded with physics-inspired spatial
-operators — Sobel-x, Sobel-y, Laplacian, identity — so the bank starts with
-meaningful edge/blob detectors rather than random noise, then adapts via
-training + per-sample mutation.
-
-### 2.3 Dynamic depth & early exit
-
-A lightweight scalar head $V_\psi$ predicts the "physical error" of $h_k$.
-If $V_\psi(h_k) < \tau$ (default $0.1$), the loop terminates early — the lens
-is in focus — saving compute. Complex scenes run the full $K$; quiet ones
-stop at $k\!\approx\!2$. $V_\psi$ is trained both self-supervised (to predict
-the residual latent error to the target) and grounded against MOVi's per-frame
-collision-force magnitude (a genuine physics quantity, not a binary flag).
-
-### 2.4 Loss functions
-
-The JEPA core loss is **final-only** — MSE between $h_K$ and the
-stop-gradient EMA target. Energy/divergence regularizers supervise the whole
-trajectory instead.
-
-| Loss | Form | Weight | Purpose |
-|---|---|---|---|
-| **JEPA** | $\|h_K - \mathrm{sg}(\text{target})\|_2^2$ | 1.0 | latent prediction |
-| **Energy conservation** | $\big|\,\|h_K\|_2 - \|h_0\|_2\,\big|^2$ | 0.1 | forbid zeroing the state |
-| **Contrastive dynamics** | $\mathrm{ReLU}(m - \|h_K - h_0\|_2)\cdot\mathbf{1}[v_{gt}\!>\!0]$ | 0.05 | penalize stasis when a push existed |
-| **Divergence regularization** | $\overline{\big|\,\|h_k\| - \|h_{k-1}\|\,\big|}$ | 0.05 | per-step constant density |
-| **Violation aux** | $\mathrm{ReLU}(v_k - v_{k-1}).\mathrm{mean}()$ | 0.01 | monotonic focusing |
-| **Violation self-sup** | $\mathrm{MSE}(v_k,\,\|h_k\!-\!\text{target}\|^2)$ | 0.1 | teach $V_\psi$ its own error |
-| **Violation grounded** | $\mathrm{Smooth}\ell_1(v_K, v_{gt})$ | 0.1 | collision-force regression |
-| **VICReg var + cov** | hinge std + off-diag covariance | 1.0 / 1.0 | collapse safety net |
-| **Kernel diversity** | $\overline{\big|\cos(K_i^{\mathrm{base}}, K_j^{\mathrm{base}})\big|}$ | 0.01 | prevent filter collapse |
-
-### 2.5 Asynchronous probing decoder
-
-The JEPA loss never decodes pixels. A separate `VizDecoder` (4 conv-transpose
-blocks, ~200K params) is trained in its **own optimizer + backward pass** on
-a *detached* $h_K$, every `decoder_interval=4` JEPA steps — zero gradient
-entanglement with the thinking loop. The decoder learns to reconstruct $s_t$
-from the frozen latent, providing an on-demand "viewport" to see what the
-model is imagining without forcing the JEPA to predict pixels during
-deliberation.
-
-### 2.6 Curriculum K
-
-To prevent the gradients from vanishing into a collapsed state before the
-lens knows how to focus, $K$ is not fixed at training start. A per-epoch
-linear schedule ramps $K_{\min}\!=\!1 \to K_{\max}\!=\!15$ over
-`curriculum_warmup_epochs=5` (`cfg.resolve_K(epoch)`). Both `train_step`
-and `eval_step` use the epoch's $K_{\mathrm{epoch}}$.
-
-## 3. Training & Optimization
-
-### 3.1 VRAM survival
-
-Training a recurrent loop on 8 GB requires aggressive memory management:
-
-- **Gradient checkpointing** — `torch.utils.checkpoint` inside the $K$-loop
-  (enabled by default in v3); intermediate activations are discarded and
-  recomputed during backward.
-- **Automatic Mixed Precision** — bf16 autocast on Ampere.
-- **Weight sharing** — the kernel lens is one set of weights reused $K$ times,
-  so activation memory is the only $K$-dependent cost (and checkpointing
-  caps it).
-- **Memory-fraction guard** — `set_per_process_memory_fraction(0.95)`.
-
-### 3.2 Model size
-
-| Component | Params |
-|---|---|
-| Context encoder $E_\theta$ | 0.49 M |
-| EMA target encoder $E_{\bar\theta}$ | 0.49 M (frozen) |
-| Kernel Lens (base kernels + gate + mutator) | ~0.33 M |
-| Violation head $V_\psi$ | ~0.16 M |
-| **JEPA total** | **~1.5 M** |
-| Asynchronous probing decoder | 0.21 M |
-
-The v3 kernel lens (~0.33M) is dramatically smaller than the v2 MoE lens
-bank (~4.4M of N parallel MLPs + router), making it far more tractable on a
-laptop GPU while gaining test-time compute via kernel mutation.
-
-## 4. Quick Start
-
-### 4.1 Environment
-
-A single `uv`-managed Python 3.11 env (PyTorch + `tfrecord` + Pillow).
-**No TensorFlow anywhere.**
+### Setup
 
 ```bash
-uv sync
+uv sync  # Python 3.11 (single env, PyTorch + tfrecord)
 ```
 
-### 4.2 Data
+### Data
 
-MOVi-A tfds shards are parsed with the pure-Python `tfrecord` package and
-emitted as v3 `.npz` caches (RGB frames + `violation_gt`).
+Download MOVi-A from tfds and convert to .npz caches (RGB + violation_gt grounded signal):
 
 ```bash
-# Easy way (recommended): builds train + dev with recommended defaults
-# (50 train shards, force-scale 1.0, 256x256 frames) for an 8 GB laptop.
-uv run python scripts/build_data.py
+uv run python scripts/build_data.py                    # full train + dev
 uv run python scripts/build_data.py --max-shards 10   # quick test
-uv run python scripts/build_data.py --dev-only         # just the dev split
-uv run python scripts/build_data.py --scan-scale        # tune force-scale
-
-# Full control (single split, custom params): see scripts/build_data.py --help
-uv run python scripts/build_data.py --tfds-split train --out-split train --force-scale 1.0
-uv run python scripts/build_data.py --tfds-split validation --out-split dev
+uv run python scripts/build_data.py --dev-only         # dev split only
 ```
 
-### 4.3 Training
+### Train
 
 ```bash
-# Easy way (recommended): every Config field is a CLI override (kebab-case).
-# The full config is printed before training starts. Run with --help to see
-# all options.
-uv run python scripts/train.py
+uv run python scripts/train.py                    # defaults (8GB-friendly)
 uv run python scripts/train.py --exp-name big --epochs 40 --batch-size 256
-uv run python scripts/train.py --fast    # 500-sample smoke test
+uv run python scripts/train.py --fast              # 500-sample smoke test
+```
 
-# Metrics + gif dashboard
+All config fields are CLI overrides (kebab-case). Run `--help` to see options. Metrics go to Aim:
+
+```bash
 aim up
 ```
 
-### 4.4 Development
+### Develop
 
 ```bash
-uv run ruff check . --fix   # lint + auto-fix
-uv run pytest               # tests (22 tests, CPU, synthetic shards)
+uv run ruff check . --fix   # lint + fix
+uv run pytest               # 22 tests, CPU-only
 uv run mypy rd_jepa/        # type check
 ```
 
-## 5. Repository Layout
+## Project structure
 
 ```
 rd_jepa/
-├── config.py              single Config dataclass + resolve_K curriculum
-├── losses.py              JEPA + energy + contrastive + divergence + VICReg + kernel diversity
-├── train.py               train_step / train_decoder_step / eval_step / train
-├── data/loader.py         MoviTransitionDataset (v3 .npz cache)
-├── models/
-│   ├── rd_jepa.py         RDJEPA: encode -> K-loop kernel lens -> early exit
-│   ├── deliberation.py    KernelLens (mutating conv kernels) + ViolationHead
-│   ├── encoder.py         spatial CNN encoder
-│   └── ema.py             EMA target encoder (BYOL-style stop-grad)
-├── eval/
-│   ├── probe.py           linear probe train/eval on violation target
-│   └── probe_module.py    ViolationProbe (MSE / R²)
-└── viz/
-    ├── decoder.py         VizDecoder + make_decoder_optimizer (async probing)
-    ├── gif_writer.py      deliberation + rollout gif rendering
-    └── aim_logger.py      Aim scalar/image logging
+  config.py              Config dataclass + curriculum_K
+  losses.py              JEPA + energy + contrastive + divergence + VICReg + diversity
+  train.py               train_step / eval_step / train
+  data/loader.py         MOVi transition dataset (v3 .npz)
+  models/
+    rd_jepa.py           RDJEPA: encoder → K-step loop → early exit
+    deliberation.py      KernelLens (mutating kernels) + ViolationHead
+    encoder.py           spatial CNN
+    ema.py               EMA target encoder
+  eval/
+    probe.py             linear probe on violation target
+    probe_module.py      ViolationProbe (MSE / R²)
+  viz/
+    decoder.py           VizDecoder (async probing)
+    gif_writer.py        deliberation + rollout gifs
+    aim_logger.py        Aim logging
 scripts/
-├── build_data.py          MOVi tfds -> .npz cache (v3 format) + easy CLI
-└── train.py               easy training entry point (all Config fields as CLI flags)
-tests/test_movi_pipeline.py  22 tests: data + model + kernel lens + losses + decoder contract
+  build_data.py          MOVi tfds → .npz + CLI
+  train.py               easy entry point
+tests/
+  test_movi_pipeline.py  22 tests
 docs/
-├── architecture.drawio    Figure 1 source (draw.io)
-├── architecture.png       Figure 1 (raster, rendered @ 3x scale)
-└── architecture.svg       Figure 1 (vector, web-friendly)
-data/cache/                MOVi transition cache (v3: RGB + violation_gt)
-runs/ + .aim/              experiment outputs
+  architecture.drawio    diagram source
+  architecture.png       rendered
+  architecture.svg       web-friendly
+data/cache/              .npz caches
+runs/                    checkpoints + outputs
 ```
-
-## 6. Implementation Notes
-
-- **One Python version** — `uv` manages only 3.11 (training AND data
-  generation); the previous dual-Python PhyRE setup has been removed.
-- **No TensorFlow** — MOVi tfds shards parsed with `tfrecord` (pure Python).
-- **Cache format v3** — RGB frames `[H,W,3]` uint8 + `violation_gt` float
-  (collision-force regression target), replacing PhyRE v2's scene-id maps +
-  `solved` bool.
-- **VICReg** — variance/covariance regularization prevents representation
-  collapse (a safety net beyond the energy/contrastive terms).
-- **Action modality removed** — MOVi is passive video; the kernel lens
-  refines a purely visual latent.
-- **Mutating kernel lens** — N=4 depthwise conv kernels that operate on the
-  spatial latent and evolve per-sample during the K steps. A mutator network
-  reads the pooled latent and produces per-sample kernel deltas each step;
-  the kernels literally transform based on the input. An attention gate
-  selects which kernels to activate; a `kernel_diversity_loss` prevents
-  filter collapse. Seeded with Sobel-x, Sobel-y, Laplacian, identity priors.
-
-## 7. v3 Breaking Changes
-
-- `Config(n_lenses=4, ...)` no longer works — use `n_kernels=4`. The removed
-  v2 fields (`n_lenses`, `load_balance_weight`, `router_entropy_weight`) are
-  **rejected**. New fields: `n_kernels`, `kernel_size`,
-  `kernel_diversity_weight`.
-- Old `runs/*/ckpt.pt` files (MoE `LensBank` with `lens.lenses.{i}.*` +
-  `lens.router.*` keys) **will not load** — `RDJEPA.lens` is now a
-  `KernelLens` whose state-dict keys are `lens.base_kernels`, `lens.gate.*`,
-  `lens.mutator.*`. Start fresh from a new run.
-- `batch_size` reduced from 256 to 128; `grad_checkpoint` now defaults to
-  `True` (laptop-friendly). `hidden_dim` reduced from 256 to 128.
-- `latent_dim` fixed to 1024 (was incorrectly 512 in v2 despite the comment).
-- `VizDecoder.decoder_loss` no longer detaches internally — the caller
-  (`train_decoder_step`) detaches `h_K` explicitly. Direct callers of
-  `decoder_loss` must pass `h.detach()`.
 
 ## License
 
