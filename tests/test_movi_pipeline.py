@@ -10,6 +10,8 @@ asynchronous probing decoder).
 from __future__ import annotations
 
 import inspect
+import importlib
+import sys
 
 import numpy as np
 import pytest
@@ -88,6 +90,19 @@ def test_config_rejects_removed_kwargs():
         pass
     else:
         raise AssertionError("Config should reject removed n_lenses= kwarg")
+
+
+def test_aim_logger_is_noop_when_package_missing():
+    sys.modules.pop("rd_jepa.viz.aim_logger", None)
+    module = importlib.import_module("rd_jepa.viz.aim_logger")
+    logger = module.AimLogger(Config(exp_name="test"))
+
+    logger.init_run()
+    logger.log_metrics({"metric": 1.0}, step=1)
+    logger.log_image("img", np.zeros((2, 2, 3), dtype=np.uint8), step=1)
+    logger.close()
+
+    assert logger.run is None
 
 
 def test_resolve_K_linear():

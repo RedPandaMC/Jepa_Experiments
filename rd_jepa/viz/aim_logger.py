@@ -11,18 +11,28 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aim import Run
-
 from ..config import Config
 
 
 class AimLogger:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.run: Run | None = None
+        self.run = None
+        self._available = False
+        try:
+            from aim import Run  # type: ignore
+        except ModuleNotFoundError:
+            self._available = False
+            self._run_cls = None
+        else:
+            self._available = True
+            self._run_cls = Run
 
     def init_run(self) -> None:
-        self.run = Run(
+        if not self._available or self._run_cls is None:
+            self.run = None
+            return
+        self.run = self._run_cls(
             experiment=self.cfg.exp_name,
             system_tracking_interval=None,
         )

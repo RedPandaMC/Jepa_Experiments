@@ -32,15 +32,15 @@ class Config:
     # --- model (spatial latent, flat externally) ---
     # latent is [B, latent_channels, 4, 4] -> flat latent_dim = latent_channels * 16
     latent_channels: int = 64
-    latent_dim: int = 1024  # = latent_channels * 4 * 4
+    latent_dim: int = 512  # = latent_channels * 4 * 4
     # encoder in_channels = img_channels * 2 (two stacked frames for velocity)
-    hidden_dim: int = 128
+    hidden_dim: int = 64
     encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
 
     # --- kernel lens ---
     # N depthwise conv kernels that mutate per-sample during K steps.
-    n_kernels: int = 4
-    kernel_size: int = 3
+    n_kernels: int = 2
+    kernel_size: int = 5
 
     # --- deliberation loop (curriculum K_min -> K_max) ---
     K_min: int = 1
@@ -55,14 +55,14 @@ class Config:
     violation_force_scale: float = 50000.0  # MOVi collision forces are ~1e4-1e5
 
     # --- training ---
-    batch_size: int = 128  # reduced for laptop (RTX 3070 8GB)
+    batch_size: int = 512  # reduced for laptop (RTX 3070 8GB)
     lr: float = 3e-4
     weight_decay: float = 1e-5
-    epochs: int = 20
+    epochs: int = 10
     amp_dtype: str = "bfloat16"  # bf16 on Ampere
     grad_checkpoint: bool = True  # enabled by default for laptop VRAM
     ema_decay: float = 0.996
-    ema_warmup: int = 100
+    ema_warmup: int = 50
 
     # --- LR schedule ---
     lr_warmup_steps: int = 500  # linear warmup steps
