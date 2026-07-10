@@ -1,12 +1,13 @@
-r"""Top-level RD-JEPA v2 model: encode -> K-step lens refinement -> early exit.
+r"""Top-level RD-JEPA v2 model: encode -> K-step lens-bank refinement -> early exit.
 
-Implements the Lens Paradigm (spec §2.2): a single shared refinement
-function $F_\theta$ is applied K times to iteratively focus the latent
-until it is physically sharp. Weight sharing keeps VRAM flat in K.
+Implements the Lens Paradigm (spec §2.2): a bank of N soft-routed specialist
+lenses is applied K times to iteratively focus the latent until it is
+physically sharp. Weight sharing keeps VRAM flat in K (only one bank is
+instantiated, reused at every step).
 
 Cache v3 input (MOVi): two stacked RGB frames (s_{t-1}, s_t) for context
 and (s_t, s_{t+1}) for target, providing velocity information. There is no
-action modality in MOVi, so the lens refines a purely visual latent.
+action modality in MOVi, so the lens bank refines a purely visual latent.
 
 The latent is always spatial ([B, latent_channels, 4, 4] -> flat d for the
 deliberation MLPs) so the divergence-projection mask (v2 core fix #2) has
@@ -17,6 +18,7 @@ The loop returns:
   - k_used: per-sample number of steps actually taken (<= K).
   - all_h: stack of intermediate latents [K, B, d] (energy/contrastive/div losses).
   - violations: [K, B] violation scores at each step (for early exit + aux loss).
+  - gates: [K, B, N] router softmax weights at each step (or None if n_lenses==1).
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import Config
-from .deliberation import DeliberationStep, ViolationHead
+from .deliberation import LensBank, ViolationHead
 from .ema import EMATargetEncoder
 from .encoder import Encoder
 
@@ -46,11 +48,13 @@ class RDJEPA(nn.Module):
         self.spatial = True
         self.flat_dim = d
 
-        self.lens = DeliberationStep(
+        self.lens = LensBank(
             latent_dim=d,
             hidden_dim=cfg.hidden_dim,
             latent_channels=cfg.latent_channels,
+            n_lenses=cfg.n_lenses,
         )
+        self.n_lenses = cfg.n_lenses
         self.violation = ViolationHead(latent_dim=d, hidden_dim=d)
 
         # Optional LayerNorm on encoder output for training stability
@@ -71,18 +75,18 @@ class RDJEPA(nn.Module):
 
     def _refine_step(
         self, h: torch.Tensor, use_checkpoint: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One lens application; returns (h_next, violation_k)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """One lens-bank application; returns (h_next, violation_k, gate_k)."""
 
-        def run(hh: torch.Tensor) -> torch.Tensor:
-            return self.lens(hh)
+        def run(hh: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+            return self.lens(hh)  # type: ignore[no-any-return]
 
         if use_checkpoint and h.requires_grad:
-            h_next = checkpoint(run, h, use_reentrant=False)
+            h_next, gate = checkpoint(run, h, use_reentrant=False)  # type: ignore[no-any-return]
         else:
-            h_next = run(h)
+            h_next, gate = run(h)
         v = self.violation(h_next)
-        return h_next, v
+        return h_next, v, gate
 
     def forward(
         self,
@@ -91,7 +95,7 @@ class RDJEPA(nn.Module):
         early_exit: bool = False,
         tau: float = 0.1,
         use_checkpoint: bool = True,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor | None]:
         """Run the deliberation loop.
 
         Args:
@@ -111,13 +115,15 @@ class RDJEPA(nn.Module):
 
         all_h = []
         all_v = []
+        all_gates: list[torch.Tensor | None] = []
         k_used = torch.full((B,), K, device=device, dtype=torch.long)
         exited = torch.zeros(B, dtype=torch.bool, device=device)
 
         for k in range(K):
-            h, v = self._refine_step(h, use_checkpoint)
+            h, v, gate = self._refine_step(h, use_checkpoint)
             all_h.append(h)
             all_v.append(v)
+            all_gates.append(gate)
 
             if early_exit and not exited.all():
                 below = (v < tau) & (~exited)
@@ -133,13 +139,19 @@ class RDJEPA(nn.Module):
                     for _ in range(remainder):
                         all_h.append(h)
                         all_v.append(v)
+                        all_gates.append(gate)
                     break
+
+        gates_stack: torch.Tensor | None = None
+        if self.n_lenses > 1 and all_gates[0] is not None:
+            gates_stack = torch.stack(all_gates, dim=0)  # type: ignore[arg-type]
 
         return {
             "h_K": h,
             "k_used": k_used,
             "all_h": torch.stack(all_h, dim=0),  # [K, B, d]
             "violations": torch.stack(all_v, dim=0),  # [K, B]
+            "gates": gates_stack,  # [K, B, N] or None
         }
 
     def target(self, s_target: torch.Tensor) -> torch.Tensor:

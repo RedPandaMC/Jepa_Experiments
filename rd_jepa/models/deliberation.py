@@ -1,24 +1,27 @@
-r"""The shared refinement function $F_\theta$ — the "lens" (v2).
+r"""The lens bank — a turret of N soft-routed specialist lenses (v2).
 
-At each deliberation step k the lens produces a residual delta composed of
-two fused phases, now framed as a fluid simulator:
+At each deliberation step k a router reads $h_{k-1}$ and emits softmax
+weights over N specialist lenses; the bank's update is the weighted sum of
+the N lens deltas, mass-renormalized to $\|\overline{\Delta}_i\|$ (the mean
+delta magnitude) and bounded by tanh:
 
-  1. Additive (advection):    h_add_k = MLP_add(h_{k-1})
-  2. Subtractive (projection): divergence-project h_add to enforce
-     incompressibility (constant latent mass), via a learned per-sample
-     projection scalar applied to the Sobel-diverggence field, followed by
-     an L2 mass renormalization.
+  1. Each lens $i$ produces its additive-then-projected delta
+     $\Delta_i = F_\theta^{(i)}(h_{k-1}) - h_{k-1}$.
+  2. Router: $g = \mathrm{softmax}(\mathrm{router}(h_{k-1})) \in \mathbb{R}^N$.
+  3. Mixed delta: $\Delta = \sum_i g_i\,\Delta_i$.
+  4. Mass renorm: rescale $\Delta$ so $\|\Delta\|_2 \approx \|\overline{\Delta}_i\|_2$.
+  5. Residual update: $h_k = h_{k-1} + \tanh(\Delta)$.
 
-  3. Residual update:          h_k = h_{k-1} + tanh(h_projected)
+Each specialist lens keeps its own additive MLP and divergence projection
+(per-lens `mlp_alpha` for specialization; the fixed Sobel kernels are
+identical across lenses). The single `ViolationHead` scores the state
+regardless of which lens produced it.
 
-The latent is always spatial: flat [B, d] in/out for the MLPs, reshaped to
-[B, C, 4, 4] for the divergence operator. The additive phase is advection;
-the subtractive phase is the CFD projection step that redistributes density
-rather than zeroing overlap.
+There is no action modality in the MOVi dataset — the lens bank refines a
+purely visual latent toward a physically-grounded target.
 
-There is no action modality in the MOVi dataset — the lens refines a purely
-visual latent toward a physically-grounded target, so the additive phase
-consumes only the previous latent.
+When `n_lenses == 1` the router is not created and the single lens is
+called directly, reproducing the original single-lens path.
 """
 from __future__ import annotations
 
@@ -164,3 +167,82 @@ class ViolationHead(nn.Module):
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """[B, latent_dim] -> [B] scalar violation scores."""
         return self.net(h).squeeze(-1)
+
+
+class LensBank(nn.Module):
+    r"""A turret of N specialist lenses combined by a soft-routing router.
+
+    Each lens is a `DeliberationStep` (additive MLP + divergence projection).
+    A lightweight router reads $h_{k-1}$ and emits softmax weights over the
+    N lenses; the bank's update is the weighted sum of the N lens deltas,
+    mass-renormalized to the mean delta magnitude and bounded by tanh.
+
+    When ``n_lenses == 1`` the router is not created and the single lens is
+    called directly (exact single-lens path, ``gate`` is ``None``).
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 1024,
+        hidden_dim: int = 512,
+        latent_channels: int = 64,
+        n_lenses: int = 4,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.n_lenses = n_lenses
+        self.lenses = nn.ModuleList(
+            [
+                DeliberationStep(
+                    latent_dim=latent_dim,
+                    hidden_dim=hidden_dim,
+                    latent_channels=latent_channels,
+                )
+                for _ in range(n_lenses)
+            ]
+        )
+        # Router only when there is a real choice to make.
+        if n_lenses > 1:
+            self.router: nn.Sequential | None = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, n_lenses),
+            )
+        else:
+            self.router = None
+
+    def forward(
+        self, h: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply one bank refinement step.
+
+        Args:
+            h: [B, latent_dim] previous latent (flat).
+        Returns:
+            (h_next, gate): h_next is [B, latent_dim]; gate is [B, N] softmax
+            weights, or None when n_lenses == 1.
+        """
+        if self.n_lenses == 1:
+            return self.lenses[0](h), None
+
+        # Per-lens deltas: F_i(h) - h  (the update, not h_next).
+        deltas = torch.stack(
+            [lens(h) - h for lens in self.lenses], dim=1
+        )  # [B, N, d]
+
+        logits = self.router(h)  # type: ignore[misc]  # [B, N]
+        gate = torch.softmax(logits, dim=-1)  # [B, N]
+
+        mixed = (gate.unsqueeze(-1) * deltas).sum(dim=1)  # [B, d]
+
+        # Mass renormalization: rescale the mixed delta so its magnitude
+        # matches the per-sample mean delta magnitude (preserve the
+        # incompressibility spirit when soft-mixing lens outputs).
+        mean_delta = deltas.mean(dim=1)  # [B, d]
+        in_norm = torch.norm(mean_delta, p=2, dim=-1)  # [B]
+        out_norm = torch.norm(mixed, p=2, dim=-1)  # [B]
+        scale = (in_norm / (out_norm + 1e-6)).unsqueeze(-1)  # [B, d]
+        mixed = mixed * scale
+
+        delta = torch.tanh(mixed)
+        return h + delta, gate

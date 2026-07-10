@@ -12,6 +12,8 @@ Spec §3.2 plus three core fixes:
      physical push (violation_gt > 0) was present.
   6. Divergence regularization: penalize per-step latent mass change across
      the K trajectory (constant-density / incompressibility proxy).
+  7. Lens-bank routing aux: load-balance (uniform usage) + entropy bonus
+     (non-degenerate routing). Only active when n_lenses > 1.
 """
 from __future__ import annotations
 
@@ -168,6 +170,40 @@ def divergence_reg_loss(all_h: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return diffs.mean()
 
 
+def load_balance_loss(gates: torch.Tensor | None) -> torch.Tensor:
+    r"""MoE load-balance loss: penalize non-uniform router usage.
+
+    $N \cdot \sum_i \bar{g}_i^{\,2}$ where $\bar{g}_i$ is the mean usage of
+    lens $i$ across the batch and K steps. Encourages all lenses to receive
+    roughly equal routing mass on average. Returns 0 when ``gates`` is None
+    (single-lens path, no router).
+    """
+    if gates is None:
+        return torch.zeros((), device=torch.device("cpu"))
+    # gates: [K, B, N]
+    n = gates.shape[-1]
+    usage = gates.mean(dim=(0, 1))  # [N]
+    return n * (usage.pow(2)).sum()
+
+
+def router_entropy_loss(
+    gates: torch.Tensor | None, eps: float = 1e-8
+) -> torch.Tensor:
+    r"""Mean router entropy (to be maximized by the composer).
+
+    Returns $-\mathrm{mean}_{k,b}\sum_i g_i \log g_i$ — the mean Shannon
+    entropy of the per-step gate distribution. The composer subtracts a
+    weight times this value from the total, so minimizing the total loss
+    maximizes routing entropy (encouraging non-degenerate, spread routing).
+    Returns 0 when ``gates`` is None (single-lens path).
+    """
+    if gates is None:
+        return torch.zeros((), device=torch.device("cpu"))
+    # gates: [K, B, N]
+    ent = -(gates * (gates + eps).log()).sum(dim=-1)  # [K, B]
+    return ent.mean()
+
+
 def total_loss(
     all_h: torch.Tensor,
     h_final: torch.Tensor,
@@ -175,6 +211,7 @@ def total_loss(
     violations: torch.Tensor,
     cfg: Config,
     violation_gt: torch.Tensor | None = None,
+    gates: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Total RD-JEPA v2 loss + a dict of metric names for logging.
 
@@ -209,6 +246,10 @@ def total_loss(
         )
     l_div = divergence_reg_loss(all_h)
 
+    # Lens-bank routing aux losses (only when n_lenses > 1).
+    l_lb = load_balance_loss(gates)
+    l_ent = router_entropy_loss(gates)
+
     total = (
         l_jepa
         + cfg.violation_weight * l_viol
@@ -219,8 +260,10 @@ def total_loss(
         + cfg.energy_weight * l_energy
         + cfg.contrastive_weight * l_contrastive
         + cfg.divergence_reg_weight * l_div
+        + cfg.load_balance_weight * l_lb
+        - cfg.router_entropy_weight * l_ent
     )
-    metrics = {
+    metrics: dict[str, float] = {
         "loss/total": total.detach().float().item(),
         "loss/jepa": l_jepa.detach().float().item(),
         "loss/violation_aux": l_viol.detach().float().item(),
@@ -231,6 +274,13 @@ def total_loss(
         "loss/energy": l_energy.detach().float().item(),
         "loss/contrastive": l_contrastive.detach().float().item(),
         "loss/divergence_reg": l_div.detach().float().item(),
+        "loss/load_balance": l_lb.detach().float().item(),
+        "loss/router_entropy": l_ent.detach().float().item(),
         "repr/std_mean": h_final.std(dim=0).mean().detach().float().item(),
     }
+    # Per-lens mean usage for monitoring specialization.
+    if gates is not None:
+        usage = gates.mean(dim=(0, 1)).detach().float()  # [N]
+        for i in range(usage.shape[0]):
+            metrics[f"router/lens_{i}_usage"] = usage[i].item()
     return total, metrics

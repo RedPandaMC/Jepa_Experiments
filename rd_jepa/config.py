@@ -36,6 +36,9 @@ class Config:
     # encoder in_channels = img_channels * 2 (two stacked frames for velocity)
     hidden_dim: int = 512
     encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
+    # Lens bank: N specialist lenses soft-routed by a per-step gate.
+    # n_lenses=1 disables routing (single-lens path, no router in the graph).
+    n_lenses: int = 4
 
     # --- deliberation loop (curriculum K_min -> K_max is the only path) ---
     K_min: int = 1
@@ -74,6 +77,9 @@ class Config:
     divergence_reg_weight: float = 0.05
     contrastive_margin: float = 1.0
     vicreg_target_std: float = 1.0  # target std per dimension for variance loss
+    # Lens-bank routing aux losses (only used when n_lenses > 1).
+    load_balance_weight: float = 0.01  # MoE uniform-usage aux
+    router_entropy_weight: float = 0.005  # non-degenerate routing bonus
 
     # --- asynchronous probing decoder (separate step is the only path) ---
     decoder_lr: float = 3e-4
@@ -97,6 +103,8 @@ class Config:
                     f"Config field '{forbidden}' is removed in v2 (no ablation "
                     "knobs). Use the unified architecture as-is."
                 )
+        if self.n_lenses < 1:
+            raise ValueError("n_lenses must be >= 1")
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

@@ -19,10 +19,12 @@ from rd_jepa.losses import (
     contrastive_dynamics_loss,
     divergence_reg_loss,
     energy_conservation_loss,
+    load_balance_loss,
+    router_entropy_loss,
     total_loss,
     violation_grounded_loss,
 )
-from rd_jepa.models.deliberation import DivergenceProjection
+from rd_jepa.models.deliberation import DivergenceProjection, LensBank
 from rd_jepa.models.rd_jepa import RDJEPA
 from rd_jepa.viz.decoder import VizDecoder, make_decoder_optimizer
 
@@ -59,6 +61,10 @@ def test_config_v2_defaults():
         assert not hasattr(cfg, forbidden)
     # decoder async config
     assert cfg.decoder_interval == 4
+    # lens bank
+    assert cfg.n_lenses == 4
+    assert cfg.load_balance_weight == 0.01
+    assert cfg.router_entropy_weight == 0.005
 
 
 def test_config_rejects_removed_kwargs():
@@ -114,6 +120,7 @@ def test_model_forward_no_action():
     assert out["h_K"].shape == (2, cfg.latent_total_dim)
     assert out["all_h"].shape == (3, 2, cfg.latent_total_dim)
     assert out["violations"].shape == (3, 2)
+    assert out["gates"].shape == (3, 2, cfg.n_lenses)
     # forward must NOT accept an action arg anymore.
     params = list(inspect.signature(RDJEPA.forward).parameters)
     assert "action" not in params
@@ -204,7 +211,8 @@ def test_end_to_end_loss():
     target = model.target(torch.randn(4, cfg.encoder_in_channels, 64, 64))
     gt = torch.rand(4)
     loss, metrics = total_loss(
-        out["all_h"], out["h_K"], target, out["violations"], cfg, violation_gt=gt
+        out["all_h"], out["h_K"], target, out["violations"], cfg,
+        violation_gt=gt, gates=out["gates"],
     )
     assert torch.isfinite(loss)
     assert "loss/violation_grounded" in metrics
@@ -213,3 +221,86 @@ def test_end_to_end_loss():
     assert "loss/energy" in metrics
     assert "loss/contrastive" in metrics
     assert "loss/divergence_reg" in metrics
+    assert "loss/load_balance" in metrics
+    assert "loss/router_entropy" in metrics
+    assert "router/lens_0_usage" in metrics
+
+
+def test_n_lenses_1_matches_single_lens():
+    """n_lenses=1 must reproduce the exact single-lens path (no router)."""
+    cfg = Config(n_lenses=1)
+    bank = LensBank(
+        latent_dim=cfg.latent_total_dim,
+        hidden_dim=cfg.hidden_dim,
+        latent_channels=cfg.latent_channels,
+        n_lenses=1,
+    )
+    from rd_jepa.models.deliberation import DeliberationStep
+
+    single = DeliberationStep(
+        latent_dim=cfg.latent_total_dim,
+        hidden_dim=cfg.hidden_dim,
+        latent_channels=cfg.latent_channels,
+    )
+    # Copy bank's single lens weights into the standalone lens.
+    single.load_state_dict(bank.lenses[0].state_dict())
+    assert bank.router is None
+
+    h = torch.randn(4, cfg.latent_total_dim)
+    out_bank, gate = bank(h)
+    out_single = single(h)
+    assert gate is None
+    assert torch.allclose(out_bank, out_single, atol=1e-6)
+
+
+def test_lens_bank_router_shape():
+    """Router gate must be [B, N] and sum to 1 per sample."""
+    cfg = Config(n_lenses=4)
+    bank = LensBank(
+        latent_dim=cfg.latent_total_dim,
+        hidden_dim=cfg.hidden_dim,
+        latent_channels=cfg.latent_channels,
+        n_lenses=4,
+    )
+    h = torch.randn(3, cfg.latent_total_dim)
+    h_next, gate = bank(h)
+    assert h_next.shape == (3, cfg.latent_total_dim)
+    assert gate is not None
+    assert gate.shape == (3, 4)
+    assert torch.allclose(gate.sum(dim=-1), torch.ones(3), atol=1e-5)
+
+
+def test_lens_bank_mass_conservation():
+    """Soft-mixed delta should roughly preserve latent mass across steps.
+
+    Note: the DivergenceProjection preserves mass exactly (tested above),
+    but the full lens applies tanh *after* the projection, and the bank
+    applies tanh again after mixing. tanh compresses magnitudes slightly,
+    so we check approximate conservation (within a few percent), not exact.
+    """
+    cfg = Config(n_lenses=4, K_max=1)
+    model = RDJEPA(cfg)
+    x = torch.randn(4, cfg.encoder_in_channels, 64, 64)
+    out = model(x, K=2, use_checkpoint=False)
+    n0 = torch.norm(out["all_h"][0], p=2, dim=-1)
+    nK = torch.norm(out["all_h"][1], p=2, dim=-1)
+    # tanh compression allows a small drift; check it's within 5%.
+    ratio = nK / n0.clamp(min=1e-6)
+    assert (ratio > 0.95).all() and (ratio < 1.05).all()
+
+
+def test_load_balance_loss_uniform():
+    """Uniform gates should yield ~0 load-balance loss."""
+    N = 4
+    gates = torch.full((3, 8, N), 1.0 / N)
+    loss = load_balance_loss(gates)
+    # N * sum( (1/N)^2 * N ) = N * (1/N) = 1... actually:
+    # usage_i = 1/N for all i, loss = N * sum_i (1/N)^2 = N * N * (1/N^2) = 1
+    # The minimum of the loss is 1 (uniform). Non-uniform > 1.
+    assert abs(loss.item() - 1.0) < 1e-6
+
+
+def test_load_balance_loss_none():
+    """gates=None (single lens) should give 0 loss."""
+    assert load_balance_loss(None).item() == 0.0
+    assert router_entropy_loss(None).item() == 0.0

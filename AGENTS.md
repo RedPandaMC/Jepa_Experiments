@@ -84,18 +84,29 @@ uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import t
     optimizer + backward pass on a **detached** `h_K`, every
     `cfg.decoder_interval` (default 4) JEPA steps — zero gradient
     entanglement with the thinking loop.
-- **Action modality removed**: MOVi is passive video; the Lens refines a purely
-  visual latent
+  - **MoE Lens Bank**: `RDJEPA.lens` is a `LensBank` of N=4 specialist
+    `DeliberationStep`s + a soft-routing router (MLP → softmax gate
+    `[B,N]` per step). Each lens keeps its own `mlp_add` +
+    `DivergenceProjection` (per-lens `mlp_alpha`); the fixed Sobel kernels
+    are identical across lenses. The bank mixes the N lens deltas by the
+    gate, mass-renormalizes to `‖mean_i delta_i‖`, and applies `tanh`.
+    `load_balance_loss` (MoE uniform-usage, weight 0.01) +
+    `router_entropy_loss` (entropy bonus, weight 0.005) prevent
+    degenerate routing. `n_lenses=1` disables routing (single-lens path,
+    `gate=None`, no router in the graph).
+- **Action modality removed**: MOVi is passive video; the Lens Bank refines a
+  purely visual latent
 
 ## v2 breaking changes (from v1)
 
 - `Config(K=15, ...)` no longer works — use `K_max=15`. The removed ablation
   fields (`gate`, `latent_shape`, `loss_trajectory`, `gamma`, `tbptt_n`, `K`)
   are rejected; the single unified architecture has no toggleable paths.
-- Old `runs/*/ckpt.pt` files (FLAT latent + sigmoid gate) **will not load**
-  into the v2 model — the `DeliberationStep` now contains `DivergenceProjection`
-  params (Sobel buffers, `mlp_alpha`) and the encoder is spatial-only. Start
-  fresh from a new run.
+- Old `runs/*/ckpt.pt` files (single `lens.*` keys) **will not load** into
+  the lens-bank model — `RDJEPA.lens` is now a `LensBank` whose state-dict
+  keys are `lens.lenses.{i}.*` + `lens.router.*`. Start fresh from a new run.
+  (`n_lenses=1` gives the same single-lens behavior but still has the
+  `lens.lenses.0.` prefix, so it's a key-path change even at N=1.)
 - `VizDecoder.decoder_loss` no longer detaches internally — the caller
   (`train_decoder_step`) detaches `h_K` explicitly. Direct callers of
   `decoder_loss` must pass `h.detach()`.

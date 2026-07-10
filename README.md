@@ -4,11 +4,12 @@
 
 **RD-JEPA** is a latent-space world model that utilizes **test-time compute**
 to perform iterative physical refinement. Instead of a single feed-forward
-pass, it runs an internal "thinking loop" — the **Lens** — that applies an
-additive-then-subtractive refinement $K$ times until the latent is
-physically sharp. Trained as a Joint-Embedding Predictive Architecture
-(JEPA), it never decodes pixels during the thinking loop; an asynchronous
-probing decoder provides an on-demand "viewport" for visualization.
+pass, it runs an internal "thinking loop" — a **Lens Bank** of N specialist
+lenses, soft-routed by a per-step gate — that applies an additive-then-
+subtractive refinement $K$ times until the latent is physically sharp.
+Trained as a Joint-Embedding Predictive Architecture (JEPA), it never decodes
+pixels during the thinking loop; an asynchronous probing decoder provides an
+on-demand "viewport" for visualization.
 
 > **Target.** Consumer GPU (NVIDIA RTX 3070, 8GB VRAM). Dataset: Kubric
 > MOVi-A (pre-rendered rigid-body collisions of CLEVR-style shapes),
@@ -18,9 +19,10 @@ probing decoder provides an on-demand "viewport" for visualization.
   <img src="docs/architecture.png" alt="RD-JEPA v2 architecture" width="100%"/>
 </p>
 <p align="sub"><b>Figure 1.</b> The RD-JEPA v2 pipeline. A spatial latent
-<b>[B, 64, 4, 4]</b> is refined <i>K</i> times by a weight-shared Lens whose
-subtractive phase is a CFD incompressibility projection (Navier–Stokes
-masking). Energy, contrastive, and divergence regularizers prevent mode
+<b>[B, 64, 4, 4]</b> is refined <i>K</i> times by a weight-shared Lens Bank
+of N=4 specialist lenses (soft-routed by a per-step gate) whose subtractive
+phase is a CFD incompressibility projection (Navier–Stokes masking). Energy,
+contrastive, divergence, and load-balance/entropy regularizers prevent mode
 collapse during BPTT. A separate VizDecoder probes the frozen <i>h<sub>K</sub></i>
 for visualization without entangling gradients with the thinking loop.
 [PDF](docs/architecture.pdf) · [SVG](docs/architecture.svg) · [source](docs/architecture.tex)</p>
@@ -31,10 +33,11 @@ for visualization without entangling gradients with the thinking loop.
 
 Standard feed-forward world predictors throw away the whole camera at each
 step and rebuild the world from scratch. RD-JEPA keeps one camera and
-**twists the same lens** $K$ times: each tiny twist carves a physical
-impossibility away until the latent image is sharp and viable. The lens is a
-single shared refinement function $F_\theta$ reused at every step, so VRAM
-is **constant** in $K$ — whether the model thinks for 3 steps or 50, the
+**twists a turret of N specialist lenses** $K$ times: a router selects which
+lens to apply at each step, and each tiny twist carves a physical
+impossibility away until the latent image is sharp and viable. The lens bank
+is a set of N refinement functions $F_\theta^{(i)}$ reused at every step, so
+VRAM is **constant** in $K$ — whether the model thinks for 3 steps or 50, the
 memory footprint does not move. This is what makes the loop tractable on
 8 GB.
 
@@ -66,6 +69,11 @@ no ablation knobs — addressing the three weaknesses of the original design:
    by the grounded collision signal, a per-step Divergence Regularizer, and
    a curriculum-K schedule $K_{\min}\!\to\!K_{\max}$ that prevents the lens
    from collapsing to a static universe under BPTT.
+4. **MoE Lens Bank** — instead of a single lens, a bank of N=4 specialist
+   lenses is soft-routed by a per-step gate. A load-balance aux loss keeps
+   usage uniform; an entropy bonus keeps routing non-degenerate. Each lens
+   develops its own `mlp_add` + `DivergenceProjection` specialization.
+   `n_lenses=1` disables routing and reproduces the single-lens path.
 
 ## 2. Method
 
@@ -83,13 +91,16 @@ stop-gradient JEPA target from $(s_t, s_{t+1})$. There is **no action
 modality** — MOVi is passive video, so the Lens refines a purely visual
 latent.
 
-### 2.2 The Lens: a recurrent refinement function $F_\theta$
+### 2.2 The Lens Bank: a turret of N soft-routed specialists
 
-At each deliberation step $k \in \{1,\dots,K\}$ the lens produces a residual
-delta composed of two fused phases, framed as a fluid simulator:
+At each deliberation step $k \in \{1,\dots,K\}$ a **router** reads $h_{k-1}$
+and emits softmax weights $g \in \mathbb{R}^N$ over N specialist lenses. Each
+lens $i$ produces its own additive-then-projected delta
+$\Delta_i = F_\theta^{(i)}(h_{k-1}) - h_{k-1}$, composed of two fused phases
+framed as a fluid simulator:
 
 1. **Additive phase (advection)** — the lens gathers momentum.
-$$h^{\mathrm{add}}_k = \mathrm{MLP}_{\mathrm{add}}(h_{k-1})$$
+$$h^{\mathrm{add}}_k = \mathrm{MLP}_{\mathrm{add}}^{(i)}(h_{k-1})$$
 
 2. **Subtractive phase (projection)** — the CFD incompressibility step. The
    additive update is reshaped to spatial $[\,C,4,4\,]$; a fixed Sobel
@@ -98,14 +109,23 @@ $$h^{\mathrm{add}}_k = \mathrm{MLP}_{\mathrm{add}}(h_{k-1})$$
    to a learned per-sample projection scalar $\alpha\!\in\!(0,1)$; the
    divergence field is subtracted and the result is L2-renormalized so
    $\|h^{\mathrm{proj}}\|_2 \approx \|h^{\mathrm{add}}\|_2$:
-$$h^{\mathrm{proj}}_k = \mathrm{Proj}_{\nabla\!\cdot}\!\big(h^{\mathrm{add}}_k\big)$$
+$$h^{\mathrm{proj}}_k = \mathrm{Proj}_{\nabla\!\cdot}^{(i)}\!\big(h^{\mathrm{add}}_k\big)$$
 
-3. **Residual update**:
-$$h_k = h_{k-1} + \tanh\!\big(h^{\mathrm{proj}}_k\big)$$
+3. **Lens delta**: $\Delta_i = \tanh\!\big(h^{\mathrm{proj}}_k\big)$
 
-The same weights are reused at every $k$ — **constant VRAM** regardless of
-$K$ (Section 3.1). The lens cannot "cheat" by zeroing the latent to avoid
-the physical-violation loss: mass conservation is built into the projection.
+The bank then **mixes** the N lens deltas by the router gate, mass-
+renormalizes the result to $\|\overline{\Delta}_i\|_2$ (the mean delta
+magnitude, preserving incompressibility), and applies the residual update:
+
+$$h_k = h_{k-1} + \tanh\!\big(\mathrm{renorm}\big(\textstyle\sum_i g_i\,\Delta_i\big)\big)$$
+
+Each lens keeps its own `mlp_add` and `DivergenceProjection` (per-lens
+`mlp_alpha` for specialization; the fixed Sobel kernels are identical across
+lenses). The single `ViolationHead` $V_\psi$ scores the state regardless of
+which lens produced it. The same bank weights are reused at every $k$ —
+**constant VRAM** regardless of $K$ (Section 3.1). When `n_lenses=1` the
+router is not created and the single lens is called directly (exact
+single-lens path).
 
 ### 2.3 Dynamic depth & early exit
 
@@ -132,6 +152,8 @@ energy/divergence regularizers now supervise the whole trajectory instead.)
 | **Violation self-sup** | $\mathrm{MSE}(v_k,\,\|h_k\!-\!\text{target}\|^2)$ | 0.1 | teach $V_\psi$ its own error |
 | **Violation grounded** | $\mathrm{Smooth}\ell_1(v_K, v_{gt})$ | 0.1 | collision-force regression |
 | **VICReg var + cov** | hinge std + off-diag covariance | 1.0 / 1.0 | collapse safety net |
+| **Load-balance** | $N\cdot\sum_i \bar{g}_i^{\,2}$ | 0.01 | uniform lens usage |
+| **Router entropy** | $-\sum_i g_i\log g_i$ (maximized) | 0.005 | non-degenerate routing |
 
 ### 2.5 Asynchronous probing decoder
 
@@ -160,8 +182,8 @@ Training a recurrent loop on 8 GB requires aggressive memory management:
 - **Gradient checkpointing** — `torch.utils.checkpoint` inside the $K$-loop;
   intermediate activations are discarded and recomputed during backward.
 - **Automatic Mixed Precision** — bf16 autocast on Ampere.
-- **Weight sharing** — the lens is one set of weights reused $K$ times, so
-  activation memory is the only $K$-dependent cost (and checkpointing
+- **Weight sharing** — the lens bank is one set of weights reused $K$ times,
+  so activation memory is the only $K$-dependent cost (and checkpointing
   caps it).
 - **Memory-fraction guard** — `set_per_process_memory_fraction(0.7)`.
 
@@ -171,9 +193,9 @@ Training a recurrent loop on 8 GB requires aggressive memory management:
 |---|---|
 | Context encoder $E_\theta$ | 0.49 M |
 | EMA target encoder $E_{\bar\theta}$ | 0.49 M (frozen) |
-| Lens $F_\theta$ (additive MLP + divergence projection) | 1.08 M |
+| Lens Bank $F_\theta^{(1\dots N)}$ (N=4: each add MLP + div projection + router) | ~4.4 M |
 | Violation head $V_\psi$ | 1.05 M |
-| **JEPA total** | **3.11 M** |
+| **JEPA total** | **~6.4 M** |
 | Asynchronous probing decoder | 0.21 M |
 
 ## 4. Quick Start
@@ -236,8 +258,8 @@ rd_jepa/
 ├── train.py               train_step / train_decoder_step / eval_step / train
 ├── data/loader.py         MoviTransitionDataset (v3 .npz cache)
 ├── models/
-│   ├── rd_jepa.py         RDJEPA: encode -> K-loop -> early exit
-│   ├── deliberation.py    DeliberationStep + DivergenceProjection + ViolationHead
+│   ├── rd_jepa.py         RDJEPA: encode -> K-loop lens bank -> early exit
+│   ├── deliberation.py    LensBank + DeliberationStep + DivergenceProjection + ViolationHead
 │   ├── encoder.py         spatial CNN encoder
 │   └── ema.py             EMA target encoder (BYOL-style stop-grad)
 ├── eval/
@@ -250,7 +272,7 @@ rd_jepa/
 scripts/
 ├── build_data.py          MOVi tfds -> .npz cache (v3 format) + easy CLI
 └── train.py               easy training entry point (all Config fields as CLI flags)
-tests/test_movi_pipeline.py  14 tests: data + model + losses + decoder contract
+tests/test_movi_pipeline.py  19 tests: data + model + lens bank + losses + decoder contract
 docs/
 ├── architecture.tex       Figure 1 source (TikZ)
 ├── architecture.pdf       Figure 1 (vector)
@@ -270,8 +292,12 @@ runs/ + .aim/              experiment outputs
   `solved` bool.
 - **VICReg** — variance/covariance regularization prevents representation
   collapse (a safety net beyond the energy/contrastive terms).
-- **Action modality removed** — MOVi is passive video; the Lens refines a
-  purely visual latent.
+- **Action modality removed** — MOVi is passive video; the Lens Bank refines
+  a purely visual latent.
+- **MoE Lens Bank** — N=4 specialist lenses soft-routed by a per-step gate.
+  Each lens has its own `mlp_add` + `DivergenceProjection`; a load-balance
+  aux loss keeps usage uniform; an entropy bonus keeps routing
+  non-degenerate. `n_lenses=1` disables routing (single-lens path).
 
 ## 7. v2 Breaking Changes
 
@@ -279,10 +305,11 @@ runs/ + .aim/              experiment outputs
   fields (`gate`, `latent_shape`, `loss_trajectory`, `gamma`, `tbptt_n`,
   `K`) are **rejected**; the single unified architecture has no toggleable
   paths.
-- Old `runs/*/ckpt.pt` files (FLAT latent + sigmoid gate) **will not load**
-  into the v2 model — `DeliberationStep` now contains `DivergenceProjection`
-  params (Sobel buffers, `mlp_alpha`) and the encoder is spatial-only.
-  Start fresh from a new run.
+- Old `runs/*/ckpt.pt` files (single `lens.*` keys) **will not load** into
+  the lens-bank model — `RDJEPA.lens` is now a `LensBank` whose state-dict
+  keys are `lens.lenses.{i}.*` + `lens.router.*`. Start fresh from a new run.
+  (`n_lenses=1` gives the same single-lens behavior but still has the
+  `lens.lenses.0.` prefix, so it's a key-path change even at N=1.)
 - `VizDecoder.decoder_loss` no longer detaches internally — the caller
   (`train_decoder_step`) detaches `h_K` explicitly. Direct callers of
   `decoder_loss` must pass `h.detach()`.

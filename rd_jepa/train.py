@@ -120,6 +120,7 @@ def vram_budget_table(cfg: Config, k_epoch: int) -> str:
         f"  reserved fraction   : {cfg.vram_fraction} -> {reserved:.2f} GB cap",
         f"  batch size          : {cfg.batch_size}",
         f"  K_max (deliberation): {cfg.K_max}  (this epoch K={k_epoch})",
+        f"  n_lenses (lens bank): {cfg.n_lenses}",
         f"  AMP dtype           : {cfg.amp_dtype}",
         f"  grad checkpoint     : {cfg.grad_checkpoint}",
         f"  decoder interval    : every {cfg.decoder_interval} JEPA steps",
@@ -164,6 +165,7 @@ def train_step(
             out["violations"],
             cfg,
             violation_gt=violation_gt,
+            gates=out["gates"],
         )
     # Widen to dict[str, Any] so we can stash transient tensors for the
     # asynchronous decoder step without violating the loss's float contract.
@@ -267,6 +269,7 @@ def eval_step(
             out["violations"],
             cfg,
             violation_gt=violation_gt,
+            gates=out["gates"],
         )
     # rename metrics to eval/ prefix
     metrics = {k.replace("loss/", "eval/loss/"): v for k, v in metrics.items()}
