@@ -19,8 +19,8 @@ build/
 runs/
 *.gif
 
-# MOVi raw tfrecord shards downloaded by scripts/build_data.py
-data/cache/_raw/
+# MOVi cache data and raw tfrecord shards downloaded by scripts/build_data.py
+data/cache/
 
 # LaTeX build artifacts (keep sources + rendered pdf/png/svg)
 docs/*.aux
