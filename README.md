@@ -33,7 +33,7 @@ evaluates representation quality on held-out data.
 ## Architecture
 
 **PatchEncoder**: 1D conv patch embedding (patch_len=6, 1-hour patches) +
-adaptive pooling + 2-layer MLP → latent z ∈ R^d (d=256).
+adaptive pooling + 2-layer MLP → latent z ∈ R^d (d=512).
 
 **AnalyticProjection**: decomposes z into N=32 amplitude-phase mode pairs
 (r_i, φ_i) via learned linear projection + atan2.
@@ -53,18 +53,17 @@ via small MLPs.
 | Loss | Default weight | Purpose |
 |---|---|---|
 | JEPA MSE | 1.0 | predict EMA target latent |
-| VICReg variance | 1.0 | prevent per-dimension collapse |
+| VICReg variance | 1.5 | prevent per-dimension collapse |
 | VICReg covariance | 1.0 | decorrelate latent dimensions |
-| Phase diversity | 0.5 | keep oscillator phases spread |
+| Phase diversity | 1.5 | keep oscillator phases spread |
 
 ## Getting started
 
 ### Setup
 
 ```bash
-uv sync                    # Python 3.11 (torch + numpy + tqdm)
+uv sync                    # Python 3.11 (torch, numpy, tqdm, optuna, mlflow, optuna-dashboard)
 uv sync --extra dev        # + pytest, ruff, mypy
-uv sync --extra optuna     # + optuna, mlflow (hyperparameter search)
 ```
 
 ### Data
@@ -87,8 +86,7 @@ uv run python scripts/train.py --fast                   # 500-sample smoke test
 
 All Config fields are CLI overrides (kebab-case). Run `--help` to see options.
 
-Metrics go to MLflow (when installed); the launch command + URL are printed at
-the end of every run:
+Metrics are tracked in MLflow:
 
 ```bash
 mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
@@ -102,12 +100,11 @@ uv run python scripts/optuna_search.py --n-trials 50 --epochs 20
 uv run python scripts/optuna_search.py --n-trials 3 --epochs 5 --fast   # quick
 ```
 
-MLflow tracks every trial; the MLflow UI and Optuna dashboard launch
-commands + URLs are printed at the end of every run:
+MLflow tracks every trial, Optuna dashboard shows the search:
 
 ```bash
-mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000      # → http://localhost:5000
-optuna-dashboard sqlite:///optuna.db --port 8080                   # → http://localhost:8080
+optuna-dashboard sqlite:///optuna.db --port 8080
+# → http://localhost:8080
 ```
 
 ### Develop
@@ -132,16 +129,18 @@ rd_jepa/
     resonator.py           AnalyticProjection + ResonatorBank + RecombineProjection
     ema.py                 EMA target encoder
   eval/forecast_probe.py   Linear forecasting probe
-  viz/mlflow_logger.py     MLflow logging wrapper
-  viz/dashboards.py        MLflow + Optuna dashboard launch helpers
+  viz/
+    mlflow_logger.py       MLflow logging
+    dashboards.py          Dashboard launch command helpers
 scripts/
   download_jena.py         Jena Climate downloader
   train.py                 easy CLI entry point
   optuna_search.py         Optuna + MLflow hyperparameter search
+  visualize.py             Animation generation
 tests/
   test_rd_jepa_pipeline.py  36 tests
 data/                      CSV data
-runs/                      checkpoints + MLflow logs
+runs/                      checkpoints + outputs
 ```
 
 ## License

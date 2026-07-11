@@ -40,7 +40,7 @@ def _get_lr_scheduler(optimizer, cfg, total_steps):
     return LambdaLR(optimizer, lr_lambda)
 
 
-def objective(trial: optuna.Trial, cfg: Config, mlflow_enabled: bool) -> float:
+def objective(trial: optuna.Trial, cfg: Config) -> float:
     import mlflow
 
     # Sample hyperparameters
@@ -56,18 +56,10 @@ def objective(trial: optuna.Trial, cfg: Config, mlflow_enabled: bool) -> float:
     cfg.phase_div_weight = trial.suggest_float("phase_div_weight", 0.1, 2.0)
     cfg.encoder_hidden = trial.suggest_categorical("encoder_hidden", [256, 512, 1024])
 
-    # Run name for MLflow
     run_name = f"trial_{trial.number}"
 
-    mlflow_ctx = (
-        mlflow.start_run(run_name=run_name)
-        if mlflow_enabled
-        else _NullContext()
-    )
-
-    with mlflow_ctx:
-        if mlflow_enabled:
-            mlflow.log_params(cfg.to_dict())
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params(cfg.to_dict())
 
         torch.manual_seed(cfg.seed)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -91,28 +83,15 @@ def objective(trial: optuna.Trial, cfg: Config, mlflow_enabled: bool) -> float:
 
             if (epoch + 1) % cfg.eval_every_n_epochs == 0 or epoch == cfg.epochs - 1:
                 val_metrics = _evaluate_loop(model, val_loader, cfg, device)
-                if mlflow_enabled:
-                    for k, v in val_metrics.items():
-                        mlflow.log_metric(k, v, step=epoch)
+                for k, v in val_metrics.items():
+                    mlflow.log_metric(k, v, step=epoch)
 
-        # Final probe evaluation
         probe = ForecastProbe(cfg.latent_dim, cfg.horizon, cfg.n_features)
         train_forecast_probe(model, probe, train_loader, cfg, device)
         probe_metrics = evaluate_forecast_probe(model, probe, val_loader, cfg, device)
+        mlflow.log_metrics(probe_metrics)
 
-        if mlflow_enabled:
-            mlflow.log_metrics(probe_metrics)
-
-        # Objective: minimize probe MSE on validation
         return probe_metrics["probe/mse"]
-
-
-class _NullContext:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
 
 
 def main() -> None:
@@ -138,15 +117,10 @@ def main() -> None:
         mlflow_tracking_uri=args.mlflow_uri,
     )
 
-    try:
-        import mlflow
-        mlflow.set_tracking_uri(cfg.mlflow_tracking_uri)
-        mlflow.set_experiment(cfg.exp_name)
-        mlflow_enabled = True
-        print(f"MLflow tracking at: {cfg.mlflow_tracking_uri}")
-    except ImportError:
-        mlflow_enabled = False
-        print("MLflow not installed — running Optuna without MLflow tracking.")
+    import mlflow
+    mlflow.set_tracking_uri(cfg.mlflow_tracking_uri)
+    mlflow.set_experiment(cfg.exp_name)
+    print(f"MLflow tracking at: {cfg.mlflow_tracking_uri}")
 
     study = optuna.create_study(
         direction="minimize",
@@ -161,7 +135,7 @@ def main() -> None:
         trial_cfg = deepcopy(cfg)
         trial_cfg.epochs = cfg.epochs
         trial_cfg.fast = cfg.fast
-        return objective(trial, trial_cfg, mlflow_enabled)
+        return objective(trial, trial_cfg)
 
     study.optimize(
         obj_wrapper,
@@ -174,7 +148,7 @@ def main() -> None:
     print(f"  Params: {study.best_trial.params}")
 
     print_dashboards(
-        mlflow_uri=cfg.mlflow_tracking_uri if mlflow_enabled else None,
+        mlflow_uri=cfg.mlflow_tracking_uri,
         optuna_storage=args.storage,
     )
 

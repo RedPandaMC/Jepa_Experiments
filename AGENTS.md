@@ -6,9 +6,9 @@ All commands use `uv` (unified package and Python manager). There is a
 ## Environment Setup
 
 ```bash
-uv sync                       # core deps (torch, numpy, tqdm, optuna)
+uv sync                       # core deps (torch, numpy, tqdm, optuna, mlflow, optuna-dashboard)
 uv sync --extra dev           # + pytest, ruff, mypy
-uv sync --extra optuna        # + mlflow, optuna-dashboard (hyperparameter search)
+uv sync --extra viz           # + matplotlib (animations)
 ```
 
 ## Development
@@ -60,7 +60,22 @@ uv run python scripts/optuna_search.py --n-trials 50 --epochs 20
 uv run python scripts/optuna_search.py --n-trials 3 --epochs 5 --fast
 
 # Custom MLflow URI
-uv run python scripts/optuna_search.py --mlflow-uri mlruns --exp-name my_search
+uv run python scripts/optuna_search.py --mlflow-uri sqlite:///mlflow.db --exp-name my_search
+```
+
+## Dashboards
+
+Both `scripts/train.py` and `scripts/optuna_search.py` print the MLflow UI
+and Optuna dashboard launch commands + URLs at the end of a run.
+
+```bash
+# MLflow UI
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+# → http://localhost:5000
+
+# Optuna dashboard
+optuna-dashboard sqlite:///optuna.db --port 8080
+# → http://localhost:8080
 ```
 
 ## Key Implementation Details
@@ -71,7 +86,7 @@ uv run python scripts/optuna_search.py --mlflow-uri mlruns --exp-name my_search
 - **GPU**: Targets RTX 3070 8GB via AMP (bf16).
 - **Architecture (Resonant Decomposition JEPA)**:
   - **PatchEncoder**: 1D conv patch embedding (patch_len=6, 1-hour patches)
-    + adaptive pooling + 2-layer MLP → latent z ∈ R^d (d=256).
+    + adaptive pooling + 2-layer MLP → latent z ∈ R^d (d=512).
   - **AnalyticProjection**: decomposes z into N=32 amplitude-phase mode
     pairs (r_i, φ_i) via learned linear projection + atan2.
   - **ResonatorBank**: K=6 steps of Kuramoto-inspired coupled-oscillator
@@ -94,7 +109,7 @@ uv run python scripts/optuna_search.py --mlflow-uri mlruns --exp-name my_search
   `scripts/optuna_search.py` print the MLflow UI and Optuna dashboard
   launch commands + URLs at the end of a run.
 
-## v5 breaking changes (from v4)
+## v5 changes (from v4)
 
 - Config fields removed: everything related to kernels, video, MOVi,
   violations, curriculum K, decoders, viz. All rejected in `__post_init__`.
@@ -103,5 +118,5 @@ uv run python scripts/optuna_search.py --mlflow-uri mlruns --exp-name my_search
 - Losses: 3 terms → 4 terms (added phase diversity loss).
 - No reconstruction decoder. Linear forecasting probe only.
 - Dependencies dropped: tfrecord, opencv-python, imageio, imageio-ffmpeg,
-  pillow, matplotlib. Optional: optuna, mlflow.
+  pillow, matplotlib. Added: optuna, mlflow, optuna-dashboard.
 - Old checkpoints will not load.

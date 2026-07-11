@@ -75,14 +75,8 @@ def main() -> None:
     cfg = Config(**overrides)
 
     logger = MLflowLogger(cfg)
-    if not logger.available:
-        print("MLflow not installed — logging to stdout only.")
-        logger = None
-
     train(cfg, logger=logger)
-
-    if logger is not None:
-        logger.close()
+    logger.close()
 
     print_dashboards(mlflow_uri=cfg.mlflow_tracking_uri)
 

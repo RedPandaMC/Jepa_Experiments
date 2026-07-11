@@ -5,13 +5,12 @@ Handles:
     - EMA target encoder updates
     - AMP (bf16) for consumer GPU
     - Async linear forecasting probe evaluation
-    - Optional MLflow logging
+    - MLflow logging
 """
 from __future__ import annotations
 
 import math
 import time
-from typing import Protocol
 
 import torch
 from torch import nn
@@ -27,14 +26,7 @@ from .eval.forecast_probe import (
 )
 from .losses import total_loss
 from .models.rd_jepa import RDJEPA
-
-
-class Logger(Protocol):
-    def init_run(self) -> None: ...
-    def log_metrics(
-        self, metrics: dict[str, float], step: int, context: dict | None = None
-    ) -> None: ...
-    def close(self) -> None: ...
+from .viz.mlflow_logger import MLflowLogger
 
 
 def _get_lr_scheduler(
@@ -58,14 +50,11 @@ def _get_lr_scheduler(
 
 def _collapse_diagnostics(h: torch.Tensor) -> dict[str, float]:
     """Effective rank via SVD entropy and mean cosine similarity."""
-    B, d = h.shape
     h_centered = h - h.mean(dim=0)
-    # effective rank
     s = torch.linalg.svdvals(h_centered)
     s_norm = s / (s.sum() + 1e-8)
     entropy = -(s_norm * (s_norm + 1e-8).log()).sum().item()
     eff_rank = torch.exp(torch.tensor(entropy)).item()
-    # mean cosine similarity
     h_norm = nn.functional.normalize(h_centered, dim=1)
     cos_sim = (h_norm @ h_norm.T).mean().item()
     return {
@@ -111,9 +100,7 @@ def train_step(
         loss.backward()
         optimizer.step()
 
-    # EMA update
     model.update_ema(step)
-
     return metrics
 
 
@@ -140,17 +127,15 @@ def eval_step(
     return metrics
 
 
-def train(cfg: Config, logger: Logger | None = None) -> None:
+def train(cfg: Config, logger: MLflowLogger | None = None) -> None:
     """Full training loop."""
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Data
     loaders = build_dataloaders(cfg)
     train_loader = loaders["train"]
     val_loader = loaders["val"]
 
-    # Model
     model = RDJEPA(cfg).to(device)
     optimizer = AdamW(
         model.parameters(),
@@ -162,14 +147,11 @@ def train(cfg: Config, logger: Logger | None = None) -> None:
     scheduler = _get_lr_scheduler(optimizer, cfg, total_steps)
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
-    # Probe
     probe = ForecastProbe(cfg.latent_dim, cfg.horizon, cfg.n_features)
 
-    # Logging
     if logger is not None:
         logger.init_run()
 
-    # Checkpoint dir
     cfg.exp_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0
@@ -178,9 +160,7 @@ def train(cfg: Config, logger: Logger | None = None) -> None:
         epoch_start = time.time()
 
         for batch in train_loader:
-            metrics = train_step(
-                model, optimizer, scaler, batch, cfg, step
-            )
+            metrics = train_step(model, optimizer, scaler, batch, cfg, step)
             scheduler.step()
 
             if logger is not None and step % cfg.log_every_n_steps == 0:
@@ -193,15 +173,11 @@ def train(cfg: Config, logger: Logger | None = None) -> None:
 
         epoch_time = time.time() - epoch_start
 
-        # Validation
         val_metrics = _evaluate_loop(model, val_loader, cfg, device)
         if logger is not None:
             logger.log_metrics(val_metrics, epoch, context={"subset": "val"})
-            logger.log_metrics(
-                {"time/epoch_seconds": epoch_time}, epoch
-            )
+            logger.log_metrics({"time/epoch_seconds": epoch_time}, epoch)
 
-        # Linear probe evaluation
         if (epoch + 1) % cfg.eval_every_n_epochs == 0 or epoch == cfg.epochs - 1:
             train_forecast_probe(model, probe, train_loader, cfg, device)
             probe_metrics = evaluate_forecast_probe(
@@ -212,7 +188,6 @@ def train(cfg: Config, logger: Logger | None = None) -> None:
                     probe_metrics, epoch, context={"subset": "probe_val"}
                 )
 
-            # Save checkpoint
             ckpt_path = cfg.exp_dir / "ckpt.pt"
             torch.save(
                 {
@@ -225,19 +200,14 @@ def train(cfg: Config, logger: Logger | None = None) -> None:
                 ckpt_path,
             )
 
-    # Final test evaluation
     test_loader = loaders["test"]
     train_forecast_probe(model, probe, train_loader, cfg, device)
-    test_probe = evaluate_forecast_probe(
-        model, probe, test_loader, cfg, device
-    )
+    test_probe = evaluate_forecast_probe(model, probe, test_loader, cfg, device)
     test_metrics = _evaluate_loop(model, test_loader, cfg, device)
     if logger is not None:
         logger.log_metrics(test_metrics, 0, context={"subset": "test"})
         logger.log_metrics(test_probe, 0, context={"subset": "probe_test"})
-        logger.log_metrics(
-            {"probe/test_mse": test_probe["probe/mse"]}, step
-        )
+        logger.log_metrics({"probe/test_mse": test_probe["probe/mse"]}, step)
 
     print(f"Test probe MSE: {test_probe['probe/mse']:.6f}")
     print(f"Test probe MAE: {test_probe['probe/mae']:.6f}")

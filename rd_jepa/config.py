@@ -21,22 +21,22 @@ class Config:
     val_ratio: float = 0.25
     test_ratio: float = 0.25
     # ── model ─────────────────────────────────────────────────────────┤
-    latent_dim: int = 256
+    latent_dim: int = 512
     n_modes: int = 32             # coupled-oscillator modes
     K_steps: int = 6              # resonance steps (fixed, no curriculum)
     dt: float = 0.1               # Euler step size
-    coupling_sparsity: float = 0.5
+    coupling_sparsity: float = 0.3
     freq_init_range: tuple[float, float] = (0.1, 2.0)
     amp_init: float = 1.0
     encoder_layers: int = 2
-    encoder_hidden: int = 512
+    encoder_hidden: int = 1024
     # ── collapse prevention ────────────────────────────────────────────┤
-    vicreg_var_weight: float = 1.0
+    vicreg_var_weight: float = 1.5
     vicreg_cov_weight: float = 1.0
     vicreg_target_std: float = 1.0
-    phase_div_weight: float = 0.5
+    phase_div_weight: float = 1.5
     # ── training ──────────────────────────────────────────────────────┤
-    batch_size: int = 256
+    batch_size: int = 512
     lr: float = 3e-4
     weight_decay: float = 1e-5
     epochs: int = 50

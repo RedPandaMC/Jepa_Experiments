@@ -49,13 +49,15 @@ def test_config_v5_defaults():
     assert cfg.context_len == 144
     assert cfg.horizon == 72
     assert cfg.n_features == 21
-    assert cfg.latent_dim == 256
+    assert cfg.latent_dim == 512
     assert cfg.n_modes == 32
     assert cfg.K_steps == 6
     assert cfg.dt == 0.1
-    assert cfg.vicreg_var_weight == 1.0
-    assert cfg.phase_div_weight == 0.5
-    assert cfg.batch_size == 256
+    assert cfg.coupling_sparsity == 0.3
+    assert cfg.encoder_hidden == 1024
+    assert cfg.vicreg_var_weight == 1.5
+    assert cfg.phase_div_weight == 1.5
+    assert cfg.batch_size == 512
     assert cfg.epochs == 50
 
 
@@ -452,12 +454,11 @@ def test_end_to_end_loss():
 # ── MLflowLogger test ────────────────────────────────────────────────────
 
 
-def test_mlflow_logger_is_noop_when_package_missing():
+def test_mlflow_logger_basic():
     from rd_jepa.viz.mlflow_logger import MLflowLogger
 
-    cfg = Config()
+    cfg = Config(exp_name="test_mlflow")
     logger = MLflowLogger(cfg)
-    # If mlflow isn't installed, should be a no-op
     logger.init_run()
     logger.log_metrics({"test": 1.0}, step=0)
     logger.close()

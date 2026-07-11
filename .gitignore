@@ -12,13 +12,6 @@ build/
 # uv
 .uv-cache/
 
-# Runs / artifacts (regenerated locally; keep the data cache)
-runs/
-*.gif
-
-# MOVi cache data and raw tfrecord shards downloaded by scripts/build_data.py
-data/cache/
-
 # LaTeX build artifacts (keep sources + rendered pdf/png/svg)
 docs/*.aux
 docs/*.fls
@@ -35,4 +28,6 @@ docs/build.log
 .DS_Store
 Thumbs.db
 
-cache/*
+Databases
+*.db*
+mlflow.db
