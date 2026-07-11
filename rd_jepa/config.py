@@ -1,141 +1,145 @@
-"""Central configuration for RD-JEPA v4 (simplified kernel lens).
+r"""Configuration for RD-JEPA v5 (Resonant Decomposition JEPA).
 
-The lens bank is a set of mutating depthwise conv kernels that operate
-on the spatial latent and evolve per-sample during the K deliberation steps.
-
-All hyperparameters live here so experiments can be swept by CLI overrides.
-
-Dataset: Kubric MOVi-A (pre-rendered physics videos, passive — no action
-modality). See scripts/build_data.py for cache generation.
+All fields are CLI-overridable via ``scripts/train.py`` (kebab-case).
+Any field name from removed versions is rejected in ``__post_init__``.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
 
 
 @dataclass
 class Config:
-    # --- data ---
-    movi_variant: str = "movi_a"  # one of movi_a/b/c/d/e
-    movi_resolution: int = 128  # source resolution to download (128 or 256)
-    split: str = "train"  # tfds split name (train/validation/test)
-    frame_size: int = 128  # frames are downsampled to this during conversion
-    img_channels: int = 3  # RGB (MOVi is RGB, not PhyRE scene-id maps)
-    cache_dir: Path = Path("data/cache")
-    runs_dir: Path = Path("runs")
-    seed: int = 42
-
-    # --- model (spatial latent, flat externally) ---
-    # latent is [B, latent_channels, 4, 4] -> flat latent_dim = latent_channels * 16
-    latent_channels: int = 64
-    latent_dim: int = 1024  # = latent_channels * 4 * 4
-    # encoder in_channels = img_channels * 2 (two stacked frames for velocity)
-    hidden_dim: int = 64
-    encoder_channels: tuple[int, ...] = (16, 32, 64, 128)
-
-    # --- kernel lens ---
-    # N depthwise conv kernels that mutate per-sample during K steps.
-    n_kernels: int = 4
-    kernel_size: int = 3
-
-    # --- deliberation loop (curriculum K_min -> K_max) ---
-    K_min: int = 1
-    K_max: int = 3
-    curriculum_warmup_epochs: int = 3  # linear ramp K_min -> K_max over these epochs
-    latent_layernorm: bool = True  # LayerNorm on encoder output before deliberation
-
-    # --- physics grounding (collision-force regression target) ---
-    violation_lookahead: int = 3  # frames ahead (after s_t) to sum collision force
-    violation_force_scale: float = 50000.0  # MOVi collision forces are ~1e4-1e5
-
-    # --- training ---
-    batch_size: int = 64  # fits 8GB VRAM at 128x128 with headroom
-    lr: float = 3e-4
-    weight_decay: float = 1e-5
-    epochs: int = 10
-    amp_dtype: str = "bfloat16"  # bf16 on Ampere
-    grad_checkpoint: bool = False  # model is small enough without it
-    ema_decay: float = 0.996
-    ema_warmup: int = 50
-
-    # --- LR schedule ---
-    lr_warmup_steps: int = 500  # linear warmup steps
-    lr_cosine: bool = True  # use cosine decay after warmup
-
-    # --- loss weights (simplified: JEPA + VICReg only) ---
+    # ── data ──────────────────────────────────────────────────────────┐
+    dataset_name: str = "jena_climate"
+    data_dir: Path = Path("data")
+    context_len: int = 144        # 1 day at 10-min resolution
+    horizon: int = 72             # 12 hours ahead
+    n_features: int = 21
+    patch_len: int = 6            # 1-hour patches
+    val_ratio: float = 0.25
+    test_ratio: float = 0.25
+    # ── model ─────────────────────────────────────────────────────────┤
+    latent_dim: int = 256
+    n_modes: int = 32             # coupled-oscillator modes
+    K_steps: int = 6              # resonance steps (fixed, no curriculum)
+    dt: float = 0.1               # Euler step size
+    coupling_sparsity: float = 0.5
+    freq_init_range: tuple[float, float] = (0.1, 2.0)
+    amp_init: float = 1.0
+    encoder_layers: int = 2
+    encoder_hidden: int = 512
+    # ── collapse prevention ────────────────────────────────────────────┤
     vicreg_var_weight: float = 1.0
     vicreg_cov_weight: float = 1.0
-    vicreg_target_std: float = 1.0  # target std per dimension for variance loss
-
-    # --- asynchronous probing decoder (separate step) ---
-    decoder_lr: float = 3e-4
-    decoder_interval: int = 4  # run decoder step every N JEPA steps (async cadence)
-    decoder_weight_decay: float = 0.0
-
-    # --- data loader ---
-    num_workers: int = 4  # parallel shard decompression
-    max_cached_shards: int = 2  # LRU cache size per worker
-
-    # --- experiment ---
+    vicreg_target_std: float = 1.0
+    phase_div_weight: float = 0.5
+    # ── training ──────────────────────────────────────────────────────┤
+    batch_size: int = 256
+    lr: float = 3e-4
+    weight_decay: float = 1e-5
+    epochs: int = 50
+    amp_dtype: str = "bfloat16"
+    ema_decay: float = 0.996
+    ema_warmup: int = 50
+    lr_warmup_steps: int = 500
+    lr_cosine: bool = True
+    num_workers: int = 2
+    # ── probe ─────────────────────────────────────────────────────────┤
+    probe_steps: int = 100
+    probe_lr: float = 1e-3
+    # ── logging / checkpoints ──────────────────────────────────────────┤
+    runs_dir: Path = Path("runs")
     exp_name: str = "default"
-    fast: bool = False  # 500-sample subset for ablations
-    vram_fraction: float = 0.90  # leave headroom on 8GB cards
+    eval_every_n_epochs: int = 5
+    log_every_n_steps: int = 50
+    # ── misc ──────────────────────────────────────────────────────────┤
+    seed: int = 42
+    fast: bool = False
+    # ── optuna ────────────────────────────────────────────────────────┤
+    optuna_n_trials: int = 50
+    optuna_timeout: int = 3600
+    mlflow_tracking_uri: str = "sqlite:///mlflow.db"
 
-    # --- visualization ---
-    viz_every_n_epochs: int = 5  # render gifs every N epochs (default: sparse)
-    viz_frame_stride: int = 2  # decode every Nth latent step for GIFs
-    viz_max_frames: int = 4  # cap GIF length to keep render cost down
-    viz_size: int = 192  # smaller output size for cheaper rendering
-
-    # Removed v3 fields (MoE lens bank, trajectory losses, early exit) and
-    # v2 fields are rejected so stale call sites fail loudly.
-    def __post_init__(self) -> None:
-        for forbidden in (
-            "gate", "latent_shape", "loss_trajectory", "gamma",
-            "tbptt_n", "K", "action_dim", "action_inject",
-            "n_lenses", "load_balance_weight", "router_entropy_weight",
+    # ── rejected field names from prior versions ───────────────────────┐
+    _REJECTED: set[str] = field(
+        default_factory=lambda: {
+            # general
+            "K", "gate", "latent_shape", "loss_trajectory", "gamma",
+            "tbptt_n", "action_dim", "action_inject", "n_lenses",
+            "load_balance_weight", "router_entropy_weight",
+            # v3 / v4
             "early_exit", "violation_tau", "violation_weight",
             "violation_supervision_weight", "violation_grounded_weight",
             "energy_weight", "contrastive_weight", "divergence_reg_weight",
             "contrastive_margin", "kernel_diversity_weight",
-        ):
-            if hasattr(self, forbidden):
-                raise TypeError(
-                    f"Config field '{forbidden}' is removed. The architecture "
-                    "now uses JEPA + VICReg only (no trajectory losses, no "
-                    "early exit). Use the simplified config as-is."
-                )
-        if self.n_kernels < 1:
-            raise ValueError("n_kernels must be >= 1")
-        if self.kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be odd (for symmetric padding)")
+            "K_min", "K_max", "curriculum_warmup_epochs",
+            "n_kernels", "kernel_size", "latent_channels",
+            "hidden_dim", "encoder_channels",
+            "movi_variant", "movi_resolution", "frame_size", "img_channels",
+            "violation_lookahead", "violation_force_scale",
+            "grad_checkpoint", "vram_fraction", "max_cached_shards",
+            "decoder_lr", "decoder_interval", "decoder_weight_decay",
+            "viz_every_n_epochs", "viz_frame_stride", "viz_max_frames",
+            "viz_size",
+        }
+    )
 
-    def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        d["cache_dir"] = str(self.cache_dir)
-        d["runs_dir"] = str(self.runs_dir)
-        return d
+    def __post_init__(self) -> None:
+        for f in fields(self):
+            if f.name.startswith("_"):
+                continue
+        # reject old field names that were passed as kwargs
+        # (works because dataclass raises TypeError for unknown fields
+        #  only when not using **kwargs; we handle **kwargs separately)
+        if hasattr(self, "_extra_rejected"):
+            bad = self._extra_rejected & self._REJECTED
+            if bad:
+                raise TypeError(
+                    f"Config no longer accepts removed fields: {bad}"
+                )
 
     @property
     def exp_dir(self) -> Path:
         return self.runs_dir / self.exp_name
 
     @property
-    def latent_total_dim(self) -> int:
-        """Flat size of the spatial latent used by the deliberation MLPs."""
-        return self.latent_channels * 4 * 4
+    def n_patches(self) -> int:
+        return self.context_len // self.patch_len
 
-    @property
-    def encoder_in_channels(self) -> int:
-        """Number of input channels to the encoder (2 stacked RGB frames)."""
-        return self.img_channels * 2
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for f in fields(self):
+            if f.name.startswith("_"):
+                continue
+            val = getattr(self, f.name)
+            if isinstance(val, Path):
+                val = str(val)
+            elif isinstance(val, tuple):
+                val = list(val)
+            result[f.name] = val
+        return result
 
-    def resolve_K(self, epoch: int) -> int:
-        """Linear curriculum schedule K_min -> K_max over warmup epochs."""
-        if self.curriculum_warmup_epochs <= 0:
-            return self.K_max
-        progress = min(epoch / self.curriculum_warmup_epochs, 1.0)
-        k = int(round(self.K_min + (self.K_max - self.K_min) * progress))
-        return max(self.K_min, min(self.K_max, k))
+
+def _check_rejected_kwargs(kwargs: dict[str, object]) -> set[str]:
+    """Call from outside to detect rejected kwarg names."""
+    rejected = {
+        "K", "gate", "latent_shape", "loss_trajectory", "gamma",
+        "tbptt_n", "action_dim", "action_inject", "n_lenses",
+        "load_balance_weight", "router_entropy_weight",
+        "early_exit", "violation_tau", "violation_weight",
+        "violation_supervision_weight", "violation_grounded_weight",
+        "energy_weight", "contrastive_weight", "divergence_reg_weight",
+        "contrastive_margin", "kernel_diversity_weight",
+        "K_min", "K_max", "curriculum_warmup_epochs",
+        "n_kernels", "kernel_size", "latent_channels",
+        "hidden_dim", "encoder_channels",
+        "movi_variant", "movi_resolution", "frame_size", "img_channels",
+        "violation_lookahead", "violation_force_scale",
+        "grad_checkpoint", "vram_fraction", "max_cached_shards",
+        "decoder_lr", "decoder_interval", "decoder_weight_decay",
+        "viz_every_n_epochs", "viz_frame_stride", "viz_max_frames",
+        "viz_size",
+    }
+    return set(kwargs.keys()) & rejected

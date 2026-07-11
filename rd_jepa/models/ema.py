@@ -37,4 +37,4 @@ class EMATargetEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+        return self.encoder(x)  # type: ignore[no-any-return]

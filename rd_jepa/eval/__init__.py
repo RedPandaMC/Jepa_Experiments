@@ -1,5 +1,12 @@
 """Evaluation utilities for RD-JEPA."""
-from .probe import evaluate_probe, train_violation_probe
-from .probe_module import ViolationProbe
+from .forecast_probe import (
+    ForecastProbe,
+    evaluate_forecast_probe,
+    train_forecast_probe,
+)
 
-__all__ = ["ViolationProbe", "train_violation_probe", "evaluate_probe"]
+__all__ = [
+    "ForecastProbe",
+    "train_forecast_probe",
+    "evaluate_forecast_probe",
+]

@@ -1,103 +1,87 @@
-"""Easy training entry point for RD-JEPA v2.
+#!/usr/bin/env python
+r"""Easy CLI entry point for RD-JEPA training.
 
-Usage:
-    uv run python scripts/train.py                      # defaults
-    uv run python scripts/train.py --exp-name big --epochs 40 --batch-size 256
-    uv run python scripts/train.py --fast                # 500-sample smoke test
-
-All Config fields can be overridden via CLI flags (kebab-case). Run with
---help to see every option. The full config is printed before training
-starts so you can verify what you're about to run.
+All Config fields are CLI overrides (kebab-case).
 """
 from __future__ import annotations
 
 import argparse
-import dataclasses
-from pathlib import Path
+import sys
+from dataclasses import fields
 
-from rd_jepa.config import Config
+from rd_jepa.config import Config, _check_rejected_kwargs
 from rd_jepa.train import train
+from rd_jepa.viz.aim_logger import AimLogger
+
+_TYPE_MAP: dict[str, type] = {
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "str": str,
+}
 
 
-def _str2bool(s: str) -> bool:
-    return s.lower() in ("true", "1", "yes")
+def _resolve_type(type_hint: object) -> type:
+    """Resolve a (possibly stringified) type hint to a concrete type."""
+    if isinstance(type_hint, type):
+        return type_hint
+    if isinstance(type_hint, str):
+        # Handle "int", "float", "str", "bool", "Path", "tuple[...]"
+        base = type_hint.split("[")[0].strip(" '\"")
+        return _TYPE_MAP.get(base, str)
+    return str
 
 
-def _str2tuple(s: str) -> tuple[int, ...]:
-    """Parse '32,64,128,256' -> (32, 64, 128, 256)."""
-    return tuple(int(x.strip()) for x in s.split(",") if x.strip())
-
-
-def _is_tuple_type(ftype: str) -> bool:
-    return "tuple" in ftype or "Sequence" in ftype or "list" in ftype
-
-
-def _build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    for f in dataclasses.fields(Config):
-        flag = f"--{f.name.replace('_', '-')}"
-        ftype = str(f.type)
-        if "bool" in ftype:
-            p.add_argument(
-                flag, type=_str2bool, default=f.default,
-                help=f"Config.{f.name} (bool, default {f.default})",
-            )
-        elif _is_tuple_type(ftype):
-            p.add_argument(
-                flag, type=_str2tuple, default=f.default,
-                help=f"Config.{f.name} (comma-sep ints, default {f.default})",
-            )
-        elif "int" in ftype:
-            p.add_argument(
-                flag, type=int, default=f.default,
-                help=f"Config.{f.name} (int, default {f.default})",
-            )
-        elif "float" in ftype:
-            p.add_argument(
-                flag, type=float, default=f.default,
-                help=f"Config.{f.name} (float, default {f.default})",
-            )
-        else:
-            p.add_argument(
-                flag, type=str, default=str(f.default),
-                help=f"Config.{f.name} (default {f.default})",
-            )
-    return p
+def _parse_value(val: str, ftype: type) -> object:
+    if ftype is bool:
+        return val.lower() in ("true", "1", "yes")
+    if ftype is int:
+        return int(val)
+    if ftype is float:
+        return float(val)
+    return val
 
 
 def main() -> None:
-    args = _build_argparser().parse_args()
+    parser = argparse.ArgumentParser(description="RD-JEPA training")
+    valid_fields = {f.name: f for f in fields(Config) if not f.name.startswith("_")}
 
-    overrides: dict = {}
-    for f in dataclasses.fields(Config):
-        raw = getattr(args, f.name)
-        if raw is None:
+    for name, f in valid_fields.items():
+        if name == "fast":
+            parser.add_argument("--fast", action="store_true", default=False)
             continue
-        ftype = str(f.type)
-        if "bool" in ftype:
-            overrides[f.name] = bool(raw)
-        elif _is_tuple_type(ftype):
-            overrides[f.name] = raw  # already a tuple from _str2tuple
-        elif "int" in ftype:
-            overrides[f.name] = int(raw)
-        elif "float" in ftype:
-            overrides[f.name] = float(raw)
-        elif "Path" in ftype:
-            overrides[f.name] = Path(raw)
+        kw = name.replace("_", "-")
+        parser.add_argument(f"--{kw}", type=str, default=None)
+
+    args = parser.parse_args()
+
+    overrides: dict[str, object] = {}
+    for name, f in valid_fields.items():
+        val = getattr(args, name)
+        if val is None:
+            continue
+        if name == "fast":
+            overrides["fast"] = val
         else:
-            overrides[f.name] = raw
+            rtype = _resolve_type(f.type)
+            overrides[name] = _parse_value(val, rtype)
+
+    bad = _check_rejected_kwargs(overrides)
+    if bad:
+        print(f"Error: rejected removed fields: {bad}", file=sys.stderr)
+        sys.exit(1)
 
     cfg = Config(**overrides)
-    print("=" * 60)
-    print("RD-JEPA v2 training run")
-    print("=" * 60)
-    for f in dataclasses.fields(Config):
-        print(f"  {f.name:30s} = {getattr(cfg, f.name)}")
-    print("=" * 60)
-    train(cfg)
+
+    logger = AimLogger(cfg)
+    if not logger.available:
+        print("Aim not installed — logging to stdout only.")
+        logger = None
+
+    train(cfg, logger=logger)
+
+    if logger is not None:
+        logger.close()
 
 
 if __name__ == "__main__":

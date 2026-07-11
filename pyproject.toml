@@ -1,19 +1,13 @@
 [project]
 name = "rd-jepa"
-version = "0.2.0"
-description = "Recurrent Deliberation JEPA — latent-space physics world model with test-time iterative refinement on Kubric MOVi"
+version = "0.5.0"
+description = "Resonant Decomposition JEPA — coupled-oscillator latent world model for multivariate time-series forecasting"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "torch>=2.2,<2.5",
     "numpy>=1.24,<2.0",
-    "imageio>=2.34",
-    "imageio-ffmpeg>=0.5",
-    "pillow>=10.0",
-    "opencv-python>=4.9",
     "tqdm>=4.66",
-    "matplotlib>=3.8",
-    "tfrecord>=1.14",
 ]
 
 [project.optional-dependencies]
@@ -22,10 +16,17 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.0",
 ]
+aim = [
+    "aim>=3.19",
+]
+optuna = [
+    "optuna>=3.6",
+    "mlflow>=2.12",
+]
 
 [tool.uv]
 # PyPI is the default index; CUDA 12.1 wheels for the RTX 3070 (Ampere) come
-# from the PyTorch index. Marked explicit so aim/tfrecord/etc. still resolve.
+# from the PyTorch index. Marked explicit so optional deps still resolve.
 [[tool.uv.index]]
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
@@ -55,5 +56,5 @@ testpaths = ["tests"]
 python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
-disallow_untyped_defs = false  # Gradual adoption - start permissive
-ignore_missing_imports = true  # For torch, tfrecord, aim, etc.
+disallow_untyped_defs = false
+ignore_missing_imports = true
