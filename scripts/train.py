@@ -11,7 +11,8 @@ from dataclasses import fields
 
 from rd_jepa.config import Config, _check_rejected_kwargs
 from rd_jepa.train import train
-from rd_jepa.viz.aim_logger import AimLogger
+from rd_jepa.viz.dashboards import print_dashboards
+from rd_jepa.viz.mlflow_logger import MLflowLogger
 
 _TYPE_MAP: dict[str, type] = {
     "int": int,
@@ -73,15 +74,17 @@ def main() -> None:
 
     cfg = Config(**overrides)
 
-    logger = AimLogger(cfg)
+    logger = MLflowLogger(cfg)
     if not logger.available:
-        print("Aim not installed — logging to stdout only.")
+        print("MLflow not installed — logging to stdout only.")
         logger = None
 
     train(cfg, logger=logger)
 
     if logger is not None:
         logger.close()
+
+    print_dashboards(mlflow_uri=cfg.mlflow_tracking_uri)
 
 
 if __name__ == "__main__":

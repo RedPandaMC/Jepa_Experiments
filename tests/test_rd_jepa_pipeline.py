@@ -449,15 +449,15 @@ def test_end_to_end_loss():
     assert all(isinstance(v, float) and v == v for v in metrics.values())  # no NaN
 
 
-# ── AimLogger test ────────────────────────────────────────────────────────
+# ── MLflowLogger test ────────────────────────────────────────────────────
 
 
-def test_aim_logger_is_noop_when_package_missing():
-    from rd_jepa.viz.aim_logger import AimLogger
+def test_mlflow_logger_is_noop_when_package_missing():
+    from rd_jepa.viz.mlflow_logger import MLflowLogger
 
     cfg = Config()
-    logger = AimLogger(cfg)
-    # If aim isn't installed, should be a no-op
+    logger = MLflowLogger(cfg)
+    # If mlflow isn't installed, should be a no-op
     logger.init_run()
     logger.log_metrics({"test": 1.0}, step=0)
     logger.close()

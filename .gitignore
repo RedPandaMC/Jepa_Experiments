@@ -12,9 +12,6 @@ build/
 # uv
 .uv-cache/
 
-# Aim
-.aim/
-
 # Runs / artifacts (regenerated locally; keep the data cache)
 runs/
 *.gif

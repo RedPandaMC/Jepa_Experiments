@@ -6,10 +6,9 @@ All commands use `uv` (unified package and Python manager). There is a
 ## Environment Setup
 
 ```bash
-uv sync                       # core deps (torch, numpy, tqdm)
+uv sync                       # core deps (torch, numpy, tqdm, optuna)
 uv sync --extra dev           # + pytest, ruff, mypy
-uv sync --extra aim           # + aim (experiment dashboard)
-uv sync --extra optuna        # + optuna, mlflow (hyperparameter search)
+uv sync --extra optuna        # + mlflow, optuna-dashboard (hyperparameter search)
 ```
 
 ## Development
@@ -91,9 +90,9 @@ uv run python scripts/optuna_search.py --mlflow-uri mlruns --exp-name my_search
   for cfg.probe_steps, evaluated on val/test. Standard JEPA eval protocol.
 - **Optuna + MLflow**: `scripts/optuna_search.py` samples hyperparameters
   (latent_dim, n_modes, K_steps, dt, coupling_sparsity, lr, loss weights,
-  etc.) and tracks every trial in MLflow.
-- **Aim**: optional experiment dashboard. `scripts/train.py` uses AimLogger
-  automatically when aim is installed.
+  etc.) and tracks every trial in MLflow. Both `scripts/train.py` and
+  `scripts/optuna_search.py` print the MLflow UI and Optuna dashboard
+  launch commands + URLs at the end of a run.
 
 ## v5 breaking changes (from v4)
 
@@ -104,5 +103,5 @@ uv run python scripts/optuna_search.py --mlflow-uri mlruns --exp-name my_search
 - Losses: 3 terms → 4 terms (added phase diversity loss).
 - No reconstruction decoder. Linear forecasting probe only.
 - Dependencies dropped: tfrecord, opencv-python, imageio, imageio-ffmpeg,
-  pillow, matplotlib. Optional: aim, optuna, mlflow.
+  pillow, matplotlib. Optional: optuna, mlflow.
 - Old checkpoints will not load.

@@ -5,12 +5,13 @@ Handles:
     - EMA target encoder updates
     - AMP (bf16) for consumer GPU
     - Async linear forecasting probe evaluation
-    - Aim logging
+    - Optional MLflow logging
 """
 from __future__ import annotations
 
 import math
 import time
+from typing import Protocol
 
 import torch
 from torch import nn
@@ -26,7 +27,14 @@ from .eval.forecast_probe import (
 )
 from .losses import total_loss
 from .models.rd_jepa import RDJEPA
-from .viz.aim_logger import AimLogger
+
+
+class Logger(Protocol):
+    def init_run(self) -> None: ...
+    def log_metrics(
+        self, metrics: dict[str, float], step: int, context: dict | None = None
+    ) -> None: ...
+    def close(self) -> None: ...
 
 
 def _get_lr_scheduler(
@@ -132,7 +140,7 @@ def eval_step(
     return metrics
 
 
-def train(cfg: Config, logger: AimLogger | None = None) -> None:
+def train(cfg: Config, logger: Logger | None = None) -> None:
     """Full training loop."""
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

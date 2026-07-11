@@ -23,6 +23,7 @@ from rd_jepa.eval.forecast_probe import (
 )
 from rd_jepa.models.rd_jepa import RDJEPA
 from rd_jepa.train import _evaluate_loop, train_step
+from rd_jepa.viz.dashboards import print_dashboards
 
 
 def _get_lr_scheduler(optimizer, cfg, total_steps):
@@ -121,6 +122,10 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--mlflow-uri", type=str, default="sqlite:///mlflow.db")
+    parser.add_argument(
+        "--storage", type=str, default="sqlite:///optuna.db",
+        help="Optuna storage URI (needed for the Optuna dashboard).",
+    )
     parser.add_argument("--exp-name", type=str, default="optuna_search")
     args = parser.parse_args()
 
@@ -146,6 +151,8 @@ def main() -> None:
     study = optuna.create_study(
         direction="minimize",
         study_name=cfg.exp_name,
+        storage=args.storage,
+        load_if_exists=True,
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
     )
 
@@ -165,6 +172,11 @@ def main() -> None:
     print("\n=== Best trial ===")
     print(f"  Value (probe MSE): {study.best_trial.value:.6f}")
     print(f"  Params: {study.best_trial.params}")
+
+    print_dashboards(
+        mlflow_uri=cfg.mlflow_tracking_uri if mlflow_enabled else None,
+        optuna_storage=args.storage,
+    )
 
 
 if __name__ == "__main__":

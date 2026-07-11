@@ -64,7 +64,6 @@ via small MLPs.
 ```bash
 uv sync                    # Python 3.11 (torch + numpy + tqdm)
 uv sync --extra dev        # + pytest, ruff, mypy
-uv sync --extra aim        # + aim (experiment dashboard)
 uv sync --extra optuna     # + optuna, mlflow (hyperparameter search)
 ```
 
@@ -88,10 +87,12 @@ uv run python scripts/train.py --fast                   # 500-sample smoke test
 
 All Config fields are CLI overrides (kebab-case). Run `--help` to see options.
 
-Metrics go to Aim (when installed):
+Metrics go to MLflow (when installed); the launch command + URL are printed at
+the end of every run:
 
 ```bash
-aim up
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+# → http://localhost:5000
 ```
 
 ### Hyperparameter search
@@ -101,10 +102,12 @@ uv run python scripts/optuna_search.py --n-trials 50 --epochs 20
 uv run python scripts/optuna_search.py --n-trials 3 --epochs 5 --fast   # quick
 ```
 
-MLflow tracks every trial:
+MLflow tracks every trial; the MLflow UI and Optuna dashboard launch
+commands + URLs are printed at the end of every run:
 
 ```bash
-mlflow ui --backend-store-uri mlruns
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000      # → http://localhost:5000
+optuna-dashboard sqlite:///optuna.db --port 8080                   # → http://localhost:8080
 ```
 
 ### Develop
@@ -129,7 +132,8 @@ rd_jepa/
     resonator.py           AnalyticProjection + ResonatorBank + RecombineProjection
     ema.py                 EMA target encoder
   eval/forecast_probe.py   Linear forecasting probe
-  viz/aim_logger.py        Aim logging wrapper
+  viz/mlflow_logger.py     MLflow logging wrapper
+  viz/dashboards.py        MLflow + Optuna dashboard launch helpers
 scripts/
   download_jena.py         Jena Climate downloader
   train.py                 easy CLI entry point
@@ -137,7 +141,7 @@ scripts/
 tests/
   test_rd_jepa_pipeline.py  36 tests
 data/                      CSV data
-runs/                      checkpoints + Aim logs
+runs/                      checkpoints + MLflow logs
 ```
 
 ## License
