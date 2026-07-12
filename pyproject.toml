@@ -1,5 +1,5 @@
 [project]
-name = "rd-jepa"
+name = "jepa-experiments"
 version = "0.5.0"
 description = "Resonant Decomposition JEPA — coupled-oscillator latent world model for multivariate time-series forecasting"
 readme = "README.md"
@@ -37,7 +37,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["rd_jepa"]
+packages = ["ts_exp_jepa"]
 
 [tool.ruff]
 line-length = 100

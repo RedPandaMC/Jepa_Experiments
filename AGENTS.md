@@ -22,7 +22,7 @@ uv run ruff check . --fix    # auto-fix issues
 uv run pytest
 
 # Type check
-uv run mypy rd_jepa/
+uv run mypy ts_exp_jepa/
 ```
 
 ## Data
@@ -47,7 +47,7 @@ uv run python scripts/train.py --exp-name big --epochs 100 --batch-size 512
 uv run python scripts/train.py --fast    # 500-sample smoke test
 
 # Direct (library entry point; same thing without argparse):
-uv run python -c "from rd_jepa.config import Config; from rd_jepa.train import train; train(Config(exp_name='default'))"
+uv run python -c "from ts_exp_jepa.config import Config; from ts_exp_jepa.train import train; train(Config(exp_name='default'))"
 ```
 
 ## Hyperparameter Search (Optuna + MLflow)
