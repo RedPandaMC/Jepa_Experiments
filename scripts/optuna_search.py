@@ -21,7 +21,7 @@ from experiments.ck_jepa.eval.forecast_probe import (
     evaluate_forecast_probe,
     train_forecast_probe,
 )
-from experiments.ck_jepa.models.ck_jepa import RDJEPA
+from experiments.ck_jepa.models.ck_jepa import CKJEPA
 from experiments.ck_jepa.train import _evaluate_loop, train_step
 from experiments.ck_jepa.viz.dashboards import print_dashboards
 
@@ -68,7 +68,7 @@ def objective(trial: optuna.Trial, cfg: Config) -> float:
         train_loader = loaders["train"]
         val_loader = loaders["val"]
 
-        model = RDJEPA(cfg).to(device)
+        model = CKJEPA(cfg).to(device)
         optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         total_steps = cfg.epochs * len(train_loader)
         scheduler = _get_lr_scheduler(optimizer, cfg, total_steps)

@@ -130,7 +130,7 @@ experiments/ck_jepa/
   train.py                 train_step / eval_step / train
   data/forecasting.py      Jena Climate dataset + loaders
   models/
-    experiments.ck_jepa.py             RDJEPA: encoder → resonator → recombine
+    experiments.ck_jepa.py             CKJEPA: encoder → resonator → recombine
     patch_encoder.py       1D patch embedding + MLP
     resonator.py           AnalyticProjection + ResonatorBank + RecombineProjection
     ema.py                 EMA target encoder

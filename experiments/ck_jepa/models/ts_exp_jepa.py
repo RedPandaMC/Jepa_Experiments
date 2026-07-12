@@ -15,7 +15,7 @@ from .patch_encoder import PatchEncoder
 from .resonator import AnalyticProjection, RecombineProjection, ResonatorBank
 
 
-class RDJEPA(nn.Module):
+class CKJEPA(nn.Module):
     """Resonant Decomposition JEPA."""
 
     def __init__(self, cfg: Config):

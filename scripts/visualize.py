@@ -27,7 +27,7 @@ import torch
 from experiments.ck_jepa.config import Config
 from experiments.ck_jepa.data.forecasting import JenaClimateDataset
 from experiments.ck_jepa.eval.forecast_probe import ForecastProbe
-from experiments.ck_jepa.models.ck_jepa import RDJEPA
+from experiments.ck_jepa.models.ck_jepa import CKJEPA
 from experiments.ck_jepa.train import train
 
 COLUMN_NAMES = [
@@ -96,7 +96,7 @@ def _cfg_from_params(params: dict[str, str]) -> Config:
     return Config(**overrides)
 
 
-def _load_checkpoint(path: Path, device: torch.device) -> tuple[RDJEPA, Config]:
+def _load_checkpoint(path: Path, device: torch.device) -> tuple[CKJEPA, Config]:
     """Load model + probe from a checkpoint."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
     import dataclasses as dc
@@ -111,13 +111,13 @@ def _load_checkpoint(path: Path, device: torch.device) -> tuple[RDJEPA, Config]:
             v = tuple(v)
         cfg_kwargs[k] = v
     cfg = Config(**cfg_kwargs)
-    model = RDJEPA(cfg).to(device)
+    model = CKJEPA(cfg).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, cfg
 
 
-def _train_quick(cfg: Config, device: torch.device) -> tuple[RDJEPA, ForecastProbe]:
+def _train_quick(cfg: Config, device: torch.device) -> tuple[CKJEPA, ForecastProbe]:
     """Train a quick model + probe for visualization."""
     print("Training a quick model for visualization...")
     train_cfg = Config(
@@ -150,7 +150,7 @@ def _train_quick(cfg: Config, device: torch.device) -> tuple[RDJEPA, ForecastPro
 
 def _get_model_and_probe(
     args, device: torch.device
-) -> tuple[RDJEPA, ForecastProbe, Config]:
+) -> tuple[CKJEPA, ForecastProbe, Config]:
     """Resolve model + probe from checkpoint, MLflow, or quick retrain."""
     if args.ckpt and Path(args.ckpt).exists():
         print(f"Loading checkpoint: {args.ckpt}")
@@ -189,7 +189,7 @@ def _get_model_and_probe(
 
 @torch.no_grad()
 def visualize_oscillator_dynamics(
-    model: RDJEPA,
+    model: CKJEPA,
     cfg: Config,
     device: torch.device,
     save_path: Path,
@@ -356,7 +356,7 @@ def visualize_oscillator_dynamics(
 
 @torch.no_grad()
 def visualize_forecasting(
-    model: RDJEPA,
+    model: CKJEPA,
     probe: ForecastProbe,
     cfg: Config,
     device: torch.device,

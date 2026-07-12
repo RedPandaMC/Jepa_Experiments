@@ -25,7 +25,7 @@ from .eval.forecast_probe import (
     train_forecast_probe,
 )
 from .losses import total_loss
-from .models.ck_jepa import RDJEPA
+from .models.ck_jepa import CKJEPA
 from .viz.mlflow_logger import MLflowLogger
 
 
@@ -64,7 +64,7 @@ def _collapse_diagnostics(h: torch.Tensor) -> dict[str, float]:
 
 
 def train_step(
-    model: RDJEPA,
+    model: CKJEPA,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler | None,
     batch: tuple[torch.Tensor, torch.Tensor],
@@ -106,7 +106,7 @@ def train_step(
 
 @torch.no_grad()
 def eval_step(
-    model: RDJEPA,
+    model: CKJEPA,
     batch: tuple[torch.Tensor, torch.Tensor],
     cfg: Config,
 ) -> dict[str, float]:
@@ -136,7 +136,7 @@ def train(cfg: Config, logger: MLflowLogger | None = None) -> None:
     train_loader = loaders["train"]
     val_loader = loaders["val"]
 
-    model = RDJEPA(cfg).to(device)
+    model = CKJEPA(cfg).to(device)
     optimizer = AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -215,7 +215,7 @@ def train(cfg: Config, logger: MLflowLogger | None = None) -> None:
 
 @torch.no_grad()
 def _evaluate_loop(
-    model: RDJEPA,
+    model: CKJEPA,
     loader,
     cfg: Config,
     device: torch.device,
