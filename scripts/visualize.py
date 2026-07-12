@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-r"""Generate rich animations of RD-JEPA forecasting and oscillator dynamics.
+r"""Generate rich animations of CK-JEPA forecasting and oscillator dynamics.
 
 Produces two MP4 animations:
     1. ``oscillator_dynamics.mp4`` — N modes on the unit circle evolving
@@ -259,7 +259,7 @@ def visualize_oscillator_dynamics(
     ax_freq = fig.add_subplot(gs[1, 1], facecolor="#1a1a2e")
     ax_couple = fig.add_subplot(gs[:, 2], facecolor="#1a1a2e")
 
-    fig.suptitle("RD-JEPA Oscillator Dynamics", color="white", fontsize=14, y=0.97)
+    fig.suptitle("CK-JEPA Oscillator Dynamics", color="white", fontsize=14, y=0.97)
 
     # Unit circle
     theta_circle = np.linspace(0, 2 * np.pi, 100)
@@ -424,7 +424,7 @@ def visualize_forecasting(
     if n_vars == 1:
         axes = [axes]
 
-    fig.suptitle("RD-JEPA Rolling Forecast (test split)",
+    fig.suptitle("CK-JEPA Rolling Forecast (test split)",
                  color="white", fontsize=14, y=0.98)
 
     L = cfg.context_len
@@ -527,7 +527,7 @@ def visualize_forecasting(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RD-JEPA visualization")
+    parser = argparse.ArgumentParser(description="CK-JEPA visualization")
     parser.add_argument("--ckpt", type=str, default=None, help="Path to checkpoint")
     parser.add_argument("--retrain", action="store_true", help="Retrain a quick model")
     parser.add_argument("--epochs", type=int, default=0, help="Epochs if retraining")

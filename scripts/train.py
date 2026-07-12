@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-r"""Easy CLI entry point for RD-JEPA training.
+r"""Easy CLI entry point for CK-JEPA training.
 
 All Config fields are CLI overrides (kebab-case).
 """
@@ -44,7 +44,7 @@ def _parse_value(val: str, ftype: type) -> object:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RD-JEPA training")
+    parser = argparse.ArgumentParser(description="CK-JEPA training")
     valid_fields = {f.name: f for f in fields(Config) if not f.name.startswith("_")}
 
     for name, f in valid_fields.items():

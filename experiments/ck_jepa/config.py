@@ -1,4 +1,4 @@
-r"""Configuration for RD-JEPA v5 (Resonant Decomposition JEPA).
+r"""Configuration for CK-JEPA v5 (Resonant Decomposition JEPA).
 
 All fields are CLI-overridable via ``scripts/train.py`` (kebab-case).
 Any field name from removed versions is rejected in ``__post_init__``.

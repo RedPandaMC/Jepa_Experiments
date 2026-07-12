@@ -1,4 +1,4 @@
-"""Evaluation utilities for RD-JEPA."""
+"""Evaluation utilities for CK-JEPA."""
 from .forecast_probe import (
     ForecastProbe,
     evaluate_forecast_probe,

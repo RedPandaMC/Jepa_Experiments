@@ -1,4 +1,4 @@
-r"""RD-JEPA model: Resonant Decomposition JEPA.
+r"""CK-JEPA model: Resonant Decomposition JEPA.
 
 Encodes a context window → decomposes latent into amplitude-phase modes →
 runs K steps of coupled-oscillator dynamics → recombines → predicts the

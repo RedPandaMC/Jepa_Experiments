@@ -1,4 +1,4 @@
-r"""Loss functions for RD-JEPA (Resonant Decomposition JEPA).
+r"""Loss functions for CK-JEPA (Resonant Decomposition JEPA).
 
 Four terms:
     1. JEPA latent prediction loss (MSE between h_K and stop-grad EMA target).

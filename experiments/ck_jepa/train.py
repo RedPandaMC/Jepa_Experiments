@@ -1,4 +1,4 @@
-r"""Training loop for RD-JEPA (Resonant Decomposition JEPA).
+r"""Training loop for CK-JEPA (Resonant Decomposition JEPA).
 
 Handles:
     - JEPA latent prediction loss + VICReg + phase diversity

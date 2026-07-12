@@ -1,10 +1,10 @@
 <mxfile host="Electron" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/24.7.17 Chrome/128.0.6613.36 Electron/32.0.1 Safari/537.36" version="24.7.17">
-  <diagram id="ck_jepa_v3" name="RD-JEPA v3 Architecture">
+  <diagram id="ck_jepa_v3" name="CK-JEPA v3 Architecture">
     <mxGraphModel dx="1167" dy="690" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2400" pageHeight="1600" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
-        <mxCell id="title" value="&lt;font style=&quot;font-size:18px;&quot;&gt;&lt;b&gt;RD-JEPA v3: Mutating Kernel Lens Architecture&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+        <mxCell id="title" value="&lt;font style=&quot;font-size:18px;&quot;&gt;&lt;b&gt;CK-JEPA v3: Mutating Kernel Lens Architecture&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
           <mxGeometry x="400" y="10" width="800" height="30" as="geometry" />
         </mxCell>
         <mxCell id="input_ctx" value="&lt;b&gt;Context Input&lt;/b&gt;&lt;br&gt;(s&lt;sub&gt;t-1&lt;/sub&gt;, s&lt;sub&gt;t&lt;/sub&gt;)&lt;br&gt;[B, 6, 128, 128]&lt;br&gt;2 stacked RGB frames" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">

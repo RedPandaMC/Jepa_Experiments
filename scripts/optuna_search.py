@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-r"""Optuna hyperparameter search for RD-JEPA with MLflow tracking.
+r"""Optuna hyperparameter search for CK-JEPA with MLflow tracking.
 
 Runs ``cfg.optuna_n_trials`` Optuna trials, each training a full model
 with sampled hyperparameters. MLflow tracks every trial's params + metrics.
@@ -95,7 +95,7 @@ def objective(trial: optuna.Trial, cfg: Config) -> float:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Optuna + MLflow search for RD-JEPA")
+    parser = argparse.ArgumentParser(description="Optuna + MLflow search for CK-JEPA")
     parser.add_argument("--n-trials", type=int, default=50)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--epochs", type=int, default=20)

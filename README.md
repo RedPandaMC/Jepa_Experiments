@@ -1,4 +1,4 @@
-# JEPA Experiments — RD-JEPA
+# JEPA Experiments — CK-JEPA
 
 **Resonant Decomposition JEPA** — a coupled-oscillator latent world model for
 multivariate time-series forecasting. Built for consumer GPUs (8GB VRAM,
@@ -9,7 +9,7 @@ variables, 10-min resolution, ~420k rows).
 
 ## How it works
 
-RD-JEPA decomposes a latent representation into N amplitude-phase mode pairs
+CK-JEPA decomposes a latent representation into N amplitude-phase mode pairs
 and evolves them through K steps of Kuramoto-inspired coupled-oscillator
 dynamics. The oscillator parameters (natural frequencies ω, coupling matrix K,
 amplitude relaxation α, equilibria r_eq) are all **input-conditioned** —

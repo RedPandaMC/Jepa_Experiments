@@ -1,6 +1,6 @@
 r"""MLflow logging wrapper.
 
-MLflow is the experiment dashboard for RD-JEPA. Runs are stored under
+MLflow is the experiment dashboard for CK-JEPA. Runs are stored under
 the tracking URI (default ``sqlite:///mlflow.db``) and viewed with
 ``mlflow ui``.
 """
