@@ -32,3 +32,9 @@ Thumbs.db
 *.db*
 *.mp4*
 *.pt*
+
+# Data files (large datasets)
+data/*.csv
+
+# Lock files
+uv.lock
