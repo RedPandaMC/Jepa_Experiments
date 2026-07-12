@@ -115,6 +115,12 @@ uv run pytest               # 36 tests, CPU-only
 uv run mypy rd_jepa/        # type check
 ```
 
+### Visualisation
+
+```bash
+uv run python scripts/visualize.py --ckpt runs/rd_jepa/ckpt.pt # Visualise results of model
+```
+
 ## Project structure
 
 ```

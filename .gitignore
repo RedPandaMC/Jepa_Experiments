@@ -28,6 +28,7 @@ docs/build.log
 .DS_Store
 Thumbs.db
 
-Databases
+# Databases
 *.db*
-mlflow.db
+*.mp4*
+*.pt*
