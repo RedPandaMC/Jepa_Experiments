@@ -24,11 +24,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ts_exp_jepa.config import Config
-from ts_exp_jepa.data.forecasting import JenaClimateDataset
-from ts_exp_jepa.eval.forecast_probe import ForecastProbe
-from ts_exp_jepa.models.ts_exp_jepa import RDJEPA
-from ts_exp_jepa.train import train
+from experiments.ck_jepa.config import Config
+from experiments.ck_jepa.data.forecasting import JenaClimateDataset
+from experiments.ck_jepa.eval.forecast_probe import ForecastProbe
+from experiments.ck_jepa.models.ck_jepa import RDJEPA
+from experiments.ck_jepa.train import train
 
 COLUMN_NAMES = [
     "p (mbar)", "T (degC)", "Tpot (K)", "Tdew (degC)", "rh (%)",

@@ -9,10 +9,10 @@ import argparse
 import sys
 from dataclasses import fields
 
-from ts_exp_jepa.config import Config, _check_rejected_kwargs
-from ts_exp_jepa.train import train
-from ts_exp_jepa.viz.dashboards import print_dashboards
-from ts_exp_jepa.viz.mlflow_logger import MLflowLogger
+from experiments.ck_jepa.config import Config, _check_rejected_kwargs
+from experiments.ck_jepa.train import train
+from experiments.ck_jepa.viz.dashboards import print_dashboards
+from experiments.ck_jepa.viz.mlflow_logger import MLflowLogger
 
 _TYPE_MAP: dict[str, type] = {
     "int": int,

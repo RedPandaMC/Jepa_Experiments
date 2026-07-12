@@ -25,7 +25,7 @@ from .eval.forecast_probe import (
     train_forecast_probe,
 )
 from .losses import total_loss
-from .models.ts_exp_jepa import RDJEPA
+from .models.ck_jepa import RDJEPA
 from .viz.mlflow_logger import MLflowLogger
 
 

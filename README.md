@@ -112,25 +112,25 @@ optuna-dashboard sqlite:///optuna.db --port 8080
 ```bash
 uv run ruff check . --fix   # lint + fix
 uv run pytest               # 36 tests, CPU-only
-uv run mypy ts_exp_jepa/        # type check
+uv run mypy experiments/ck_jepa/        # type check
 ```
 
 ### Visualisation
 
 ```bash
-uv run python scripts/visualize.py --ckpt runs/ts_exp_jepa/ckpt.pt # Visualise results of model
+uv run python scripts/visualize.py --ckpt runs/experiments/ck_jepa/ckpt.pt # Visualise results of model
 ```
 
 ## Project structure
 
 ```
-ts_exp_jepa/
+experiments/ck_jepa/
   config.py                Config dataclass (v5)
   losses.py                JEPA + VICReg + phase diversity
   train.py                 train_step / eval_step / train
   data/forecasting.py      Jena Climate dataset + loaders
   models/
-    ts_exp_jepa.py             RDJEPA: encoder → resonator → recombine
+    experiments.ck_jepa.py             RDJEPA: encoder → resonator → recombine
     patch_encoder.py       1D patch embedding + MLP
     resonator.py           AnalyticProjection + ResonatorBank + RecombineProjection
     ema.py                 EMA target encoder
@@ -144,7 +144,7 @@ scripts/
   optuna_search.py         Optuna + MLflow hyperparameter search
   visualize.py             Animation generation
 tests/
-  test_ts_exp_jepa_pipeline.py  36 tests
+  test_ck_jepa_pipeline.py  36 tests
 data/                      CSV data
 runs/                      checkpoints + outputs
 ```

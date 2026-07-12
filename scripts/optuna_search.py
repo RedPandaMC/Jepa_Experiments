@@ -14,16 +14,16 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from ts_exp_jepa.config import Config
-from ts_exp_jepa.data.forecasting import build_dataloaders
-from ts_exp_jepa.eval.forecast_probe import (
+from experiments.ck_jepa.config import Config
+from experiments.ck_jepa.data.forecasting import build_dataloaders
+from experiments.ck_jepa.eval.forecast_probe import (
     ForecastProbe,
     evaluate_forecast_probe,
     train_forecast_probe,
 )
-from ts_exp_jepa.models.ts_exp_jepa import RDJEPA
-from ts_exp_jepa.train import _evaluate_loop, train_step
-from ts_exp_jepa.viz.dashboards import print_dashboards
+from experiments.ck_jepa.models.ck_jepa import RDJEPA
+from experiments.ck_jepa.train import _evaluate_loop, train_step
+from experiments.ck_jepa.viz.dashboards import print_dashboards
 
 
 def _get_lr_scheduler(optimizer, cfg, total_steps):
